@@ -1,0 +1,1171 @@
+import { useEffect, useState } from 'react';
+import { supabase } from '../lib/supabase';
+import type { Database } from '../lib/database.types';
+import { Calendar, Users, Send, Mail, MessageSquare, RefreshCw, ChevronDown, ChevronUp, History, ExternalLink, Code2, Eye } from 'lucide-react';
+import ReactQuill from 'react-quill';
+import 'react-quill/dist/quill.snow.css';
+
+type Conversation = Database['public']['Tables']['msgraph_conversations']['Row'];
+type Message = Database['public']['Tables']['msgraph_messages']['Row'];
+type Reservation = Database['public']['Tables']['reservations']['Row'];
+type EmailTemplate = Database['public']['Tables']['email_templates']['Row'];
+type RoomType = Database['public']['Tables']['room_types']['Row'];
+
+interface SelectedRoom {
+  code: string;
+  name: string;
+  quantity: number;
+  nightly_rate: number;
+}
+
+interface ReservationDetailProps {
+  conversation: Conversation | null;
+  onReservationUpdate?: () => void;
+}
+
+export function ReservationDetail({ conversation, onReservationUpdate }: ReservationDetailProps) {
+  const [reservation, setReservation] = useState<Partial<Reservation>>({
+    guest_name: '',
+    arrival_date: '',
+    departure_date: '',
+    adults: 2,
+    children: 0,
+    room_types: [],
+    nightly_rate_currency: 'ZAR',
+    nightly_rate_amount: 0,
+  });
+  const [roomCount, setRoomCount] = useState<number>(1);
+
+  const [selectedTemplate, setSelectedTemplate] = useState<string>('');
+  const [templates, setTemplates] = useState<EmailTemplate[]>([]);
+  const [emailPreview, setEmailPreview] = useState<string>('');
+  const [availableTemplateNames, setAvailableTemplateNames] = useState<string[]>([]);
+  const [availableTones, setAvailableTones] = useState<string[]>([]);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [roomTypes, setRoomTypes] = useState<RoomType[]>([]);
+  const [selectedRooms, setSelectedRooms] = useState<SelectedRoom[]>([]);
+  const [reservationId, setReservationId] = useState<string | null>(null);
+  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+  const [extracting, setExtracting] = useState(false);
+  const [mailboxAddress, setMailboxAddress] = useState<string>('');
+  const [bookingUrlTemplate, setBookingUrlTemplate] = useState<string>('');
+  const [refreshing, setRefreshing] = useState(false);
+  const [showOriginalEmail, setShowOriginalEmail] = useState(false);
+  const [showConversationModal, setShowConversationModal] = useState(false);
+  const [showCompose, setShowCompose] = useState(false);
+  const [expandedMessageId, setExpandedMessageId] = useState<string | null>(null);
+  const [hasManualEdit, setHasManualEdit] = useState(false);
+  const [checkingEmail, setCheckingEmail] = useState(false);
+  const [showCorrectionModal, setShowCorrectionModal] = useState(false);
+  const [correctedText, setCorrectedText] = useState<string>('');
+  const [isHtmlTemplate, setIsHtmlTemplate] = useState(false);
+  const [htmlEditorMode, setHtmlEditorMode] = useState<'visual' | 'code'>('visual');
+
+  useEffect(() => {
+    loadTemplates();
+    loadRoomTypes();
+    loadMailboxSettings();
+  }, []);
+
+  async function loadMailboxSettings() {
+    const { data } = await supabase
+      .from('settings')
+      .select('mailbox_address, booking_url_template')
+      .maybeSingle();
+
+    if (data?.mailbox_address) {
+      setMailboxAddress(data.mailbox_address);
+    }
+    if (data?.booking_url_template) {
+      setBookingUrlTemplate(data.booking_url_template);
+    }
+  }
+
+  function generateBookingUrl(): string {
+    if (!bookingUrlTemplate) return '';
+
+    const arrivalDate = reservation.arrival_date || '';
+    const departureDate = reservation.departure_date || '';
+
+    let url = bookingUrlTemplate;
+    url = url.replace(/\{\{adultCount\}\}/g, String(reservation.adults || 0));
+    url = url.replace(/\{\{childCount\}\}/g, String(reservation.children || 0));
+    url = url.replace(/\{\{roomCount\}\}/g, String(roomCount));
+    url = url.replace(/\{\{arrivalDate\}\}/g, arrivalDate);
+    url = url.replace(/\{\{departureDate\}\}/g, departureDate);
+
+    return url;
+  }
+
+  async function markConversationAsViewed(conversationUuid: string) {
+    const { data: conv } = await supabase
+      .from('msgraph_conversations')
+      .select('viewed_at')
+      .eq('id', conversationUuid)
+      .maybeSingle();
+
+    if (conv && !conv.viewed_at) {
+      await supabase
+        .from('msgraph_conversations')
+        .update({ viewed_at: new Date().toISOString() })
+        .eq('id', conversationUuid);
+    }
+  }
+
+  useEffect(() => {
+    if (conversation) {
+      loadReservationData(conversation.conversation_id);
+      markMessagesAsRead(conversation.id);
+      markConversationAsViewed(conversation.id);
+      loadMessageHistory(conversation.id);
+      setShowCompose(false);
+    }
+  }, [conversation]);
+
+  useEffect(() => {
+    if (messages.length > 0 && !expandedMessageId) {
+      setExpandedMessageId(messages[messages.length - 1].id);
+    }
+  }, [messages]);
+
+  useEffect(() => {
+    generateEmailPreview();
+  }, [reservation, selectedTemplate, templates, selectedRooms]);
+
+  const quillModules = {
+    toolbar: [
+      [{ header: [1, 2, 3, false] }],
+      ['bold', 'italic', 'underline', 'strike'],
+      [{ color: [] }, { background: [] }],
+      [{ list: 'ordered' }, { list: 'bullet' }],
+      [{ align: [] }],
+      ['link', 'image'],
+      ['clean'],
+    ],
+  };
+
+  const quillFormats = [
+    'header',
+    'bold',
+    'italic',
+    'underline',
+    'strike',
+    'color',
+    'background',
+    'list',
+    'bullet',
+    'align',
+    'link',
+    'image',
+  ];
+
+  async function loadTemplates() {
+    const { data } = await supabase
+      .from('email_templates')
+      .select('*')
+      .eq('is_active', true)
+      .order('name');
+
+    if (data && data.length > 0) {
+      setTemplates(data);
+
+      const uniqueNames = [...new Set(data.map(t => t.name))];
+      const uniqueTones = [...new Set(data.map(t => t.tone))];
+
+      setAvailableTemplateNames(uniqueNames);
+      setAvailableTones(uniqueTones);
+
+      if (!selectedTemplate && data.length > 0) {
+        setSelectedTemplate(data[0].id);
+      }
+    }
+  }
+
+  async function loadRoomTypes() {
+    const { data } = await supabase
+      .from('room_types')
+      .select('*')
+      .eq('is_active', true)
+      .order('code');
+
+    if (data) {
+      setRoomTypes(data);
+    }
+  }
+
+  async function loadMessageHistory(conversationUuid: string) {
+    const { data } = await supabase
+      .from('msgraph_messages')
+      .select('*')
+      .eq('conversation_uuid', conversationUuid)
+      .order('received_at', { ascending: true });
+
+    if (data) {
+      setMessages(data);
+    }
+  }
+
+  async function refreshMessageHistory() {
+    if (!conversation || !mailboxAddress) return;
+
+    setRefreshing(true);
+    try {
+      const syncResponse = await fetch(
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/msgraph/sync-conversation`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            mailbox_address: mailboxAddress,
+            conversation_id: conversation.conversation_id
+          }),
+        }
+      );
+
+      if (!syncResponse.ok) {
+        console.error('Sync failed:', await syncResponse.text());
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 500));
+      await loadMessageHistory(conversation.id);
+    } catch (error) {
+      console.error('Error refreshing messages:', error);
+      alert('Failed to refresh messages');
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  async function markMessagesAsRead(conversationUuid: string) {
+    const { data: settings } = await supabase
+      .from('settings')
+      .select('mailbox_address')
+      .maybeSingle();
+
+    const mailboxAddress = settings?.mailbox_address;
+    if (!mailboxAddress) return;
+
+    const { data: unreadMessages } = await supabase
+      .from('msgraph_messages')
+      .select('msgraph_message_id, is_read')
+      .eq('conversation_uuid', conversationUuid)
+      .eq('is_read', false);
+
+    if (unreadMessages && unreadMessages.length > 0) {
+      for (const msg of unreadMessages) {
+        try {
+          const apiUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/msgraph/mark-read`;
+          await fetch(apiUrl, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              message_id: msg.msgraph_message_id,
+              mailbox_address: mailboxAddress
+            }),
+          });
+        } catch (error) {
+          console.error('Error marking message as read:', error);
+        }
+      }
+    }
+  }
+
+  async function loadReservationData(conversationId: string) {
+    setHasUnsavedChanges(false);
+
+    const { data: existingReservation } = await supabase
+      .from('reservations')
+      .select('*')
+      .eq('conversation_id', conversationId)
+      .maybeSingle();
+
+    if (existingReservation) {
+      setReservationId(existingReservation.id);
+      setReservation({
+        guest_name: existingReservation.guest_name,
+        arrival_date: existingReservation.arrival_date,
+        departure_date: existingReservation.departure_date,
+        adults: existingReservation.adults,
+        children: existingReservation.children,
+        room_types: existingReservation.room_types || [],
+        nightly_rate_currency: existingReservation.nightly_rate_currency,
+        nightly_rate_amount: existingReservation.nightly_rate_amount,
+      });
+
+      if (existingReservation.room_details && existingReservation.room_details.length > 0) {
+        setSelectedRooms(existingReservation.room_details);
+      } else if (existingReservation.room_types && existingReservation.room_types.length > 0) {
+        const roomsFromDb = existingReservation.room_types.map((code: string) => {
+          const roomType = roomTypes.find(rt => rt.code === code);
+          return {
+            code,
+            name: roomType?.name || code,
+            quantity: 1,
+            nightly_rate: 0
+          };
+        });
+        setSelectedRooms(roomsFromDb);
+      } else {
+        setSelectedRooms([]);
+      }
+    } else {
+      setReservationId(null);
+      setReservation({
+        guest_name: '',
+        arrival_date: '',
+        departure_date: '',
+        adults: 2,
+        children: 0,
+        room_types: [],
+        nightly_rate_currency: 'ZAR',
+        nightly_rate_amount: 0,
+      });
+      setSelectedRooms([]);
+    }
+  }
+
+  async function saveReservation() {
+    if (!conversation) return;
+
+    const roomTypeCodes = selectedRooms.map(r => r.code);
+
+    const reservationData = {
+      conversation_id: conversation.conversation_id,
+      guest_name: reservation.guest_name,
+      arrival_date: reservation.arrival_date,
+      departure_date: reservation.departure_date,
+      adults: reservation.adults || 0,
+      children: reservation.children || 0,
+      room_types: roomTypeCodes,
+      room_details: selectedRooms,
+      nightly_rate_currency: reservation.nightly_rate_currency || 'ZAR',
+      nightly_rate_amount: reservation.nightly_rate_amount || 0,
+      status: 'pending'
+    };
+
+    if (reservationId) {
+      await supabase
+        .from('reservations')
+        .update(reservationData)
+        .eq('id', reservationId);
+    } else {
+      const { data } = await supabase
+        .from('reservations')
+        .insert(reservationData)
+        .select()
+        .single();
+
+      if (data) {
+        setReservationId(data.id);
+      }
+    }
+
+    setHasUnsavedChanges(false);
+
+    if (onReservationUpdate) {
+      onReservationUpdate();
+    }
+  }
+
+  function updateReservation(updates: Partial<Reservation>) {
+    setReservation({ ...reservation, ...updates });
+    setHasUnsavedChanges(true);
+  }
+
+  async function extractReservationData(message: Message) {
+    setExtracting(true);
+
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      const apiUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/extract-reservation`;
+
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${session?.access_token || import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          emailContent: `From: ${message.from_name} <${message.from_email}>
+Subject: ${message.subject}
+
+${message.body_content || message.body_preview}`
+        }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        console.error('Failed to extract data:', errorData);
+
+        fallbackExtraction(message);
+        return;
+      }
+
+      const result = await response.json();
+      const extracted = result.data;
+
+      setReservation({
+        guest_name: extracted.guest_name || message.from_name,
+        guest_email: extracted.guest_email || message.from_email,
+        arrival_date: extracted.arrival_date || '',
+        departure_date: extracted.departure_date || '',
+        adults: extracted.adult_count || 2,
+        children: extracted.child_count || 0,
+        room_types: [],
+        nightly_rate_currency: 'ZAR',
+        nightly_rate_amount: 0,
+      });
+    } catch (error) {
+      console.error('Error extracting reservation data:', error);
+      fallbackExtraction(message);
+    } finally {
+      setExtracting(false);
+    }
+  }
+
+  function fallbackExtraction(message: Message) {
+    const body = (message.body_content || message.body_preview).toLowerCase();
+
+    const dateMatch = body.match(/(\d{1,2})[\/\-\s](\d{1,2})[\/\-\s](\d{4})/g);
+    const adultsMatch = body.match(/(\d+)\s*adults?/i);
+    const childrenMatch = body.match(/(\d+)\s*children?/i);
+    const roomMatch = body.match(/\b(CR|CMT|COS|FS|STU|MAB|CMD|CA)\b/gi);
+
+    setReservation({
+      guest_name: message.from_name,
+      guest_email: message.from_email,
+      arrival_date: dateMatch && dateMatch[0] ? parseDateString(dateMatch[0]) : '',
+      departure_date: dateMatch && dateMatch[1] ? parseDateString(dateMatch[1]) : '',
+      adults: adultsMatch ? parseInt(adultsMatch[1]) : 2,
+      children: childrenMatch ? parseInt(childrenMatch[1]) : 0,
+      room_types: roomMatch ? [...new Set(roomMatch.map(r => r.toUpperCase()))] : [],
+      nightly_rate_currency: 'ZAR',
+      nightly_rate_amount: 0,
+    });
+  }
+
+  function parseDateString(dateStr: string): string {
+    const parts = dateStr.split(/[\/\-\s]/);
+    if (parts.length === 3) {
+      const day = parts[0].padStart(2, '0');
+      const month = parts[1].padStart(2, '0');
+      const year = parts[2];
+      return `${year}-${month}-${day}`;
+    }
+    return '';
+  }
+
+  function toggleRoomSelection(roomType: RoomType) {
+    const isSelected = selectedRooms.some(r => r.code === roomType.code);
+
+    if (isSelected) {
+      setSelectedRooms(selectedRooms.filter(r => r.code !== roomType.code));
+    } else {
+      setSelectedRooms([...selectedRooms, {
+        code: roomType.code,
+        name: roomType.name,
+        quantity: 1,
+        nightly_rate: 0
+      }]);
+    }
+    setHasUnsavedChanges(true);
+  }
+
+  function updateRoomQuantity(code: string, quantity: number) {
+    setSelectedRooms(selectedRooms.map(room =>
+      room.code === code ? { ...room, quantity: Math.max(1, quantity) } : room
+    ));
+    setHasUnsavedChanges(true);
+  }
+
+  function updateRoomRate(code: string, rate: number) {
+    setSelectedRooms(selectedRooms.map(room =>
+      room.code === code ? { ...room, nightly_rate: Math.max(0, rate) } : room
+    ));
+    setHasUnsavedChanges(true);
+  }
+
+  function generateEmailPreview() {
+    const template = templates.find(t => t.id === selectedTemplate);
+
+    if (!template || !reservation.guest_name) {
+      setEmailPreview('Please select a template and fill in the guest details to preview the email.');
+      setHasManualEdit(false);
+      setIsHtmlTemplate(false);
+      return;
+    }
+
+    const hasHtml = !!((template as any).html_body_template);
+    setIsHtmlTemplate(hasHtml);
+
+    const arrivalDate = reservation.arrival_date || '';
+    const departureDate = reservation.departure_date || '';
+    const nights = arrivalDate && departureDate
+      ? Math.ceil((new Date(departureDate).getTime() - new Date(arrivalDate).getTime()) / (1000 * 60 * 60 * 24))
+      : 0;
+
+    const roomSummary = selectedRooms.length > 0
+      ? selectedRooms.map(room => `${room.quantity}x ${room.name} (${room.code})`).join(', ')
+      : 'No rooms selected';
+
+    const roomDetails = selectedRooms.length > 0
+      ? selectedRooms.map(room =>
+          `${room.quantity}x ${room.name} (${room.code}) - R${room.nightly_rate} per night`
+        ).join('\n')
+      : 'No rooms selected';
+
+    const totalRoomRate = selectedRooms.reduce((total, room) =>
+      total + (room.quantity * room.nightly_rate), 0
+    );
+
+    const totalReservationCost = totalRoomRate * nights;
+
+    let preview = hasHtml ? (template as any).html_body_template : template.body_template;
+
+    preview = preview.replace(/\{\{guest_name\}\}/g, reservation.guest_name || '');
+    preview = preview.replace(/\{\{guest_email\}\}/g, reservation.guest_email || messages[0]?.from_email || '');
+    preview = preview.replace(/\{\{arrival_date\}\}/g, formatDate(arrivalDate));
+    preview = preview.replace(/\{\{departure_date\}\}/g, formatDate(departureDate));
+    preview = preview.replace(/\{\{adults\}\}/g, String(reservation.adults || 0));
+    preview = preview.replace(/\{\{children\}\}/g, String(reservation.children || 0));
+    preview = preview.replace(/\{\{room_types\}\}/g, roomSummary);
+    preview = preview.replace(/\{\{room_details\}\}/g, roomDetails);
+    preview = preview.replace(/\{\{rate_amount\}\}/g, `R${totalRoomRate}`);
+    preview = preview.replace(/\{\{total_nights\}\}/g, String(nights));
+    preview = preview.replace(/\{\{total_cost\}\}/g, `R${totalReservationCost}`);
+
+    setEmailPreview(preview);
+    setHasManualEdit(false);
+  }
+
+  function formatDate(dateStr: string): string {
+    if (!dateStr) return '';
+    const date = new Date(dateStr);
+    return date.toLocaleDateString('en-GB', {
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric'
+    });
+  }
+
+  async function handleCheckEmailText() {
+    if (!emailPreview) return;
+
+    setCheckingEmail(true);
+    try {
+      const apiUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/check-email-text`;
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          emailText: emailPreview
+        }),
+      });
+
+      if (!response.ok) {
+        const error = await response.json();
+        alert(`Failed to check email: ${error.error}`);
+        return;
+      }
+
+      const result = await response.json();
+
+      // Only show modal if the text is different
+      if (result.correctedText !== emailPreview) {
+        setCorrectedText(result.correctedText);
+        setShowCorrectionModal(true);
+      } else {
+        alert('No corrections needed! Your email looks good.');
+        setHasManualEdit(false);
+      }
+    } catch (error) {
+      console.error('Error checking email:', error);
+      alert('Failed to check email text');
+    } finally {
+      setCheckingEmail(false);
+    }
+  }
+
+  function handleAcceptCorrection() {
+    setEmailPreview(correctedText);
+    setShowCorrectionModal(false);
+    setCorrectedText('');
+    setHasManualEdit(false);
+  }
+
+  async function handleSendEmail() {
+    if (!conversation || !messages.length) return;
+
+    const { data: settings } = await supabase
+      .from('settings')
+      .select('mailbox_address')
+      .maybeSingle();
+
+    const mailboxAddressFromSettings = settings?.mailbox_address;
+    if (!mailboxAddressFromSettings) {
+      alert('Mailbox address not configured');
+      return;
+    }
+
+    try {
+      const apiUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/msgraph/reply`;
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          message_id: messages[0].msgraph_message_id,
+          body: emailPreview,
+          is_html: isHtmlTemplate,
+          mailbox_address: mailboxAddressFromSettings
+        }),
+      });
+
+      if (response.ok) {
+        setShowCompose(false);
+
+        setTimeout(async () => {
+          await refreshMessageHistory();
+        }, 4000);
+      } else {
+        const error = await response.json();
+        alert(`Failed to send email: ${error.error}`);
+      }
+    } catch (error) {
+      console.error('Error sending email:', error);
+      alert('Failed to send email');
+    }
+  }
+
+  if (!conversation) {
+    return (
+      <div className="flex-1 flex items-center justify-center bg-slate-50">
+        <div className="text-center text-slate-400">
+          <Mail className="w-20 h-20 mx-auto mb-4 opacity-50" />
+          <p className="text-xl font-semibold text-slate-600">Select an enquiry to view details</p>
+          <p className="text-sm text-slate-500 mt-2">Choose an email from the inbox to get started</p>
+        </div>
+      </div>
+    );
+  }
+
+  const calculateNights = () => {
+    if (!reservation.arrival_date || !reservation.departure_date) return 0;
+    const arrival = new Date(reservation.arrival_date);
+    const departure = new Date(reservation.departure_date);
+    return Math.ceil((departure.getTime() - arrival.getTime()) / (1000 * 60 * 60 * 24));
+  };
+
+  return (
+    <div className="flex-1 flex flex-col bg-slate-50 h-screen overflow-hidden">
+      {/* Fixed Header Section */}
+      <div className="bg-white border-b border-slate-200 shadow-sm">
+        <div className="px-8 py-3">
+          <div className="flex justify-between items-center mb-3">
+            <h2 className="text-xl font-bold text-slate-900">{conversation.subject}</h2>
+            <button
+              onClick={refreshMessageHistory}
+              disabled={refreshing}
+              className="px-4 py-1.5 bg-white text-slate-700 rounded-lg hover:bg-slate-100 transition-all flex items-center gap-2 font-medium border border-slate-200 shadow-sm disabled:opacity-50 text-sm"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+              {refreshing ? 'Refreshing...' : 'Refresh'}
+            </button>
+          </div>
+
+          {extracting && (
+            <div className="mb-3 bg-emerald-50 border border-emerald-200 rounded-lg p-2.5 shadow-sm">
+              <div className="flex items-center gap-3">
+                <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-emerald-600"></div>
+                <span className="text-sm text-emerald-800 font-semibold">
+                  Extracting reservation data using AI...
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* Guest & Stay Details Grid */}
+          <div className="grid grid-cols-12 gap-4">
+            {/* Guest Info */}
+            <div className="col-span-2 space-y-2">
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 mb-1">Guest Name</label>
+                <input
+                  type="text"
+                  value={reservation.guest_name || ''}
+                  onChange={(e) => updateReservation({ guest_name: e.target.value })}
+                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-sky-500 focus:border-sky-500 transition-all text-sm"
+                />
+              </div>
+              {bookingUrlTemplate && (
+                <a
+                  href={generateBookingUrl()}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center justify-center gap-2 px-2.5 py-1.5 bg-sky-600 text-white rounded-lg hover:bg-sky-700 transition-all text-xs font-semibold shadow-sm w-full"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  Search Availability Online
+                </a>
+              )}
+            </div>
+
+            {/* Arrival Date */}
+            <div className="col-span-2">
+              <label className="block text-xs font-semibold text-slate-600 mb-1">Arrival</label>
+              <input
+                type="date"
+                value={reservation.arrival_date || ''}
+                onChange={(e) => updateReservation({ arrival_date: e.target.value })}
+                className="w-full px-2.5 py-1.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-sky-500 focus:border-sky-500 transition-all text-sm"
+              />
+            </div>
+
+            {/* Departure Date */}
+            <div className="col-span-2">
+              <label className="block text-xs font-semibold text-slate-600 mb-1">Departure</label>
+              <input
+                type="date"
+                value={reservation.departure_date || ''}
+                onChange={(e) => updateReservation({ departure_date: e.target.value })}
+                className="w-full px-2.5 py-1.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-sky-500 focus:border-sky-500 transition-all text-sm"
+              />
+            </div>
+
+            {/* Adults */}
+            <div className="col-span-1">
+              <label className="block text-xs font-semibold text-slate-600 mb-1">Adults</label>
+              <input
+                type="number"
+                min="1"
+                value={reservation.adults || 0}
+                onChange={(e) => updateReservation({ adults: parseInt(e.target.value) })}
+                className="w-20 px-2.5 py-1.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-sky-500 focus:border-sky-500 transition-all text-sm"
+              />
+            </div>
+
+            {/* Children */}
+            <div className="col-span-1">
+              <label className="block text-xs font-semibold text-slate-600 mb-1">Children</label>
+              <input
+                type="number"
+                min="0"
+                value={reservation.children || 0}
+                onChange={(e) => updateReservation({ children: parseInt(e.target.value) })}
+                className="w-20 px-2.5 py-1.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-sky-500 focus:border-sky-500 transition-all text-sm"
+              />
+            </div>
+
+            {/* Rooms */}
+            <div className="col-span-1">
+              <label className="block text-xs font-semibold text-slate-600 mb-1">Rooms</label>
+              <input
+                type="number"
+                min="1"
+                value={roomCount}
+                onChange={(e) => setRoomCount(parseInt(e.target.value) || 1)}
+                className="w-20 px-2.5 py-1.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-sky-500 focus:border-sky-500 transition-all text-sm"
+              />
+            </div>
+
+            {/* Summary */}
+            <div className="col-span-3">
+              <div className="bg-slate-50 rounded-lg p-2.5 border border-slate-200 h-full flex flex-col justify-center">
+                <div className="text-xs font-semibold text-slate-600 mb-0.5">Stay Summary</div>
+                <div className="text-base font-bold text-slate-900">{calculateNights()} Nights</div>
+                <div className="text-xs text-slate-600 mt-0.5">
+                  {reservation.adults || 0} Adult{(reservation.adults || 0) !== 1 ? 's' : ''}
+                  {(reservation.children || 0) > 0 && `, ${reservation.children} Child${reservation.children !== 1 ? 'ren' : ''}`}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Room Selection */}
+          <div className="mt-3">
+            <label className="block text-xs font-semibold text-slate-600 mb-1.5">Room Types</label>
+            <div className="flex flex-wrap gap-2">
+              {roomTypes.map((roomType) => (
+                <button
+                  key={roomType.code}
+                  onClick={() => toggleRoomSelection(roomType)}
+                  className={`px-2.5 py-1 border rounded-lg font-semibold text-xs transition-all ${
+                    selectedRooms.some(r => r.code === roomType.code)
+                      ? 'bg-sky-600 text-white border-sky-600 shadow-sm'
+                      : 'bg-white text-slate-700 border-slate-300 hover:border-sky-400 hover:text-sky-600'
+                  }`}
+                  title={roomType.name}
+                >
+                  {roomType.code}
+                </button>
+              ))}
+            </div>
+
+            {selectedRooms.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-2">
+                {selectedRooms.map((room) => (
+                  <div key={room.code} className="bg-slate-50 rounded-lg border border-slate-200 p-2 flex items-center gap-2">
+                    <div className="font-semibold text-slate-900 text-sm">{room.code}</div>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        min="1"
+                        value={room.quantity}
+                        onChange={(e) => updateRoomQuantity(room.code, parseInt(e.target.value) || 1)}
+                        className="w-14 px-2 py-1 border border-slate-300 rounded text-sm"
+                        placeholder="Qty"
+                      />
+                      <span className="text-slate-600 text-xs">×</span>
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        value={room.nightly_rate}
+                        onChange={(e) => updateRoomRate(room.code, parseFloat(e.target.value) || 0)}
+                        className="w-20 px-2 py-1 border border-slate-300 rounded text-sm"
+                        placeholder="Rate"
+                      />
+                      <span className="text-slate-600 text-xs">ZAR/night</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {hasUnsavedChanges && (
+            <div className="mt-3 bg-amber-50 border border-amber-300 rounded-lg p-2.5 shadow-sm flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <div className="w-2 h-2 bg-amber-500 rounded-full animate-pulse"></div>
+                <span className="text-sm font-semibold text-amber-900">Unsaved changes</span>
+              </div>
+              <button
+                onClick={saveReservation}
+                className="px-4 py-1.5 bg-sky-600 text-white rounded-lg hover:bg-sky-700 transition-all font-semibold shadow-sm text-sm"
+              >
+                Save Changes
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Scrollable Conversation History + Compose Section */}
+      <div className="flex-1 overflow-y-auto bg-slate-50 px-8 py-4">
+        <h3 className="text-base font-bold text-slate-900 mb-3 flex items-center gap-2">
+          <MessageSquare className="w-4 h-4 text-sky-600" />
+          Conversation History
+          <span className="text-sm text-slate-500 font-medium">({messages.length})</span>
+        </h3>
+
+        {messages.length === 0 ? (
+          <div className="text-center py-8 text-slate-400">
+            <MessageSquare className="w-10 h-10 mx-auto mb-2 opacity-50" />
+            <p className="text-base font-semibold">No messages yet</p>
+            <p className="text-sm mt-1">Messages will appear here once synchronized</p>
+          </div>
+        ) : (
+          <div className="space-y-2 mb-4">
+            {messages.map((msg, idx) => {
+              const mailboxDomain = mailboxAddress ? mailboxAddress.split('@')[1] : '';
+              const isOutgoing = mailboxDomain && msg.from_email ? msg.from_email.includes(`@${mailboxDomain}`) : false;
+              const isExpanded = expandedMessageId === msg.id;
+              const isLatest = idx === messages.length - 1;
+
+              return (
+                <div
+                  key={msg.id}
+                  className={`rounded-lg border shadow-sm transition-all ${
+                    isOutgoing
+                      ? 'bg-emerald-50 border-emerald-200'
+                      : 'bg-sky-50 border-sky-200'
+                  }`}
+                >
+                  <button
+                    onClick={() => setExpandedMessageId(isExpanded ? null : msg.id)}
+                    className="w-full p-3 text-left hover:bg-opacity-80 transition-all"
+                  >
+                    <div className="flex justify-between items-start gap-4">
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2 mb-2">
+                          {isLatest && !isOutgoing && (
+                            <span className="px-2 py-0.5 text-xs font-bold bg-amber-100 text-amber-700 rounded border border-amber-200">
+                              Latest
+                            </span>
+                          )}
+                          {isOutgoing && (
+                            <span className="px-2 py-0.5 text-xs font-bold bg-emerald-200 text-emerald-800 rounded border border-emerald-300">
+                              You
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="space-y-1 mb-2">
+                          <div className="flex items-start gap-2">
+                            <span className="text-xs font-bold text-slate-600 min-w-[35px]">From:</span>
+                            <div className="flex-1">
+                              <div className="font-bold text-slate-900 text-sm">{msg.from_name}</div>
+                              <div className="text-xs text-slate-600">{msg.from_email}</div>
+                            </div>
+                          </div>
+
+                          {msg.to_emails && Array.isArray(msg.to_emails) && msg.to_emails.length > 0 && (
+                            <div className="flex items-start gap-2">
+                              <span className="text-xs font-bold text-slate-600 min-w-[35px]">To:</span>
+                              <div className="flex-1 text-xs text-slate-600">
+                                {(msg.to_emails as any[]).map((email: any, i: number) => (
+                                  <span key={i}>
+                                    {typeof email === 'string' ? email : email.emailAddress?.address || email.address || ''}
+                                    {i < msg.to_emails.length - 1 && ', '}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+
+                        {!isExpanded && (
+                          <div className="text-sm text-slate-600 mt-2 line-clamp-2">
+                            {msg.body_preview}
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex flex-col items-end gap-2 flex-shrink-0">
+                        <span className="text-xs text-slate-500 font-medium whitespace-nowrap">
+                          {new Date(msg.received_at).toLocaleString('en-GB', {
+                            day: '2-digit',
+                            month: 'short',
+                            year: 'numeric',
+                            hour: '2-digit',
+                            minute: '2-digit'
+                          })}
+                        </span>
+                        {isExpanded ? (
+                          <ChevronUp className="w-5 h-5 text-slate-400" />
+                        ) : (
+                          <ChevronDown className="w-5 h-5 text-slate-400" />
+                        )}
+                      </div>
+                    </div>
+                  </button>
+
+                  {isExpanded && (
+                    <div className="px-3 pb-3 border-t border-slate-300">
+                      {msg.subject && (
+                        <div className="text-sm font-bold text-slate-700 mb-2 mt-2">
+                          Subject: {msg.subject}
+                        </div>
+                      )}
+                      <div
+                        className="text-slate-700 text-sm prose max-w-none"
+                        dangerouslySetInnerHTML={{ __html: msg.body_content || msg.body_preview }}
+                      />
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Compose Reply Section - Inline */}
+        {showCompose && (
+          <div className="mt-6 mb-4">
+            <div className="bg-white border-2 border-sky-300 rounded-xl shadow-lg p-5 space-y-4">
+              <div className="flex justify-between items-center pb-3 border-b border-slate-200">
+                <h3 className="text-lg font-bold text-slate-900 flex items-center gap-2">
+                  <Send className="w-5 h-5 text-sky-600" />
+                  Compose Reply
+                </h3>
+                <button
+                  onClick={() => setShowCompose(false)}
+                  className="px-3 py-1.5 text-sm bg-slate-100 text-slate-700 rounded-lg hover:bg-slate-200 transition-all font-semibold"
+                >
+                  Cancel
+                </button>
+              </div>
+
+              <div>
+                <label className="block text-sm font-semibold text-slate-700 mb-1.5">Email Template</label>
+                {templates.length > 0 ? (
+                  <select
+                    value={selectedTemplate}
+                    onChange={(e) => setSelectedTemplate(e.target.value)}
+                    className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-sky-500 focus:border-sky-500 transition-all font-medium text-sm"
+                  >
+                    {templates.map((template) => (
+                      <option key={template.id} value={template.id}>
+                        {template.name} - {template.tone}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <div className="w-full px-3 py-2 border border-amber-300 rounded-lg bg-amber-50 text-amber-800 text-sm font-medium">
+                    No active templates available. Please create templates in the Templates section.
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="block text-sm font-semibold text-slate-700">Email Preview</label>
+                  {isHtmlTemplate && (
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setHtmlEditorMode('visual')}
+                        className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold rounded-lg transition-all ${
+                          htmlEditorMode === 'visual'
+                            ? 'bg-emerald-600 text-white'
+                            : 'bg-slate-200 text-slate-700 hover:bg-slate-300'
+                        }`}
+                      >
+                        <Eye className="w-3.5 h-3.5" />
+                        Visual
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setHtmlEditorMode('code')}
+                        className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold rounded-lg transition-all ${
+                          htmlEditorMode === 'code'
+                            ? 'bg-emerald-600 text-white'
+                            : 'bg-slate-200 text-slate-700 hover:bg-slate-300'
+                        }`}
+                      >
+                        <Code2 className="w-3.5 h-3.5" />
+                        Code
+                      </button>
+                    </div>
+                  )}
+                </div>
+                {isHtmlTemplate && htmlEditorMode === 'visual' ? (
+                  <div className="border border-slate-300 rounded-lg overflow-hidden">
+                    <ReactQuill
+                      theme="snow"
+                      value={emailPreview}
+                      onChange={(value) => {
+                        setEmailPreview(value);
+                        setHasManualEdit(true);
+                      }}
+                      modules={quillModules}
+                      formats={quillFormats}
+                      placeholder="Email preview will appear here..."
+                      className="bg-white"
+                      style={{ minHeight: '250px' }}
+                    />
+                  </div>
+                ) : (
+                  <textarea
+                    value={emailPreview}
+                    onChange={(e) => {
+                      setEmailPreview(e.target.value);
+                      setHasManualEdit(true);
+                    }}
+                    className="w-full border border-slate-300 rounded-lg p-3 bg-white min-h-[250px] max-h-[400px] resize-y font-sans text-sm text-slate-800 focus:ring-2 focus:ring-sky-500 focus:border-sky-500 transition-all shadow-sm"
+                    placeholder="Email preview will appear here..."
+                  />
+                )}
+              </div>
+
+              <div className="flex justify-end gap-3 pt-3 border-t border-slate-200">
+                {hasManualEdit && (
+                  <button
+                    onClick={handleCheckEmailText}
+                    disabled={checkingEmail || !emailPreview}
+                    className="px-6 py-2 bg-amber-600 text-white rounded-lg hover:bg-amber-700 transition-all font-bold flex items-center gap-2 disabled:bg-slate-300 disabled:cursor-not-allowed shadow-sm text-sm"
+                  >
+                    {checkingEmail ? (
+                      <>
+                        <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+                        Checking...
+                      </>
+                    ) : (
+                      'Check Email Text'
+                    )}
+                  </button>
+                )}
+                <button
+                  onClick={handleSendEmail}
+                  disabled={hasManualEdit || !selectedTemplate || !emailPreview || emailPreview.includes('Please select')}
+                  className="px-6 py-2 bg-sky-600 text-white rounded-lg hover:bg-sky-700 transition-all font-bold flex items-center gap-2 disabled:bg-slate-300 disabled:cursor-not-allowed shadow-sm text-sm"
+                >
+                  <Send className="w-4 h-4" />
+                  Send Reply
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Fixed Bottom CTA - Only shown when not composing */}
+      {!showCompose && (
+        <div className="bg-white border-t border-slate-200 shadow-lg px-8 py-3">
+          <button
+            onClick={() => setShowCompose(true)}
+            className="w-full px-4 py-2.5 bg-sky-600 text-white rounded-lg hover:bg-sky-700 transition-all font-bold flex items-center justify-center gap-2 shadow-sm"
+          >
+            <Send className="w-4 h-4" />
+            Compose Reply
+          </button>
+        </div>
+      )}
+
+      {/* Correction Modal */}
+      {showCorrectionModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-lg shadow-xl max-w-3xl w-full max-h-[80vh] overflow-hidden flex flex-col">
+            <div className="px-6 py-4 border-b border-slate-200">
+              <h3 className="text-lg font-bold text-slate-900">Suggested Corrections</h3>
+              <p className="text-sm text-slate-600 mt-1">Review the corrected version below</p>
+            </div>
+
+            <div className="flex-1 overflow-y-auto px-6 py-4">
+              <div className="mb-4">
+                <label className="block text-xs font-semibold text-slate-600 mb-2">Original Text:</label>
+                <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm text-slate-700 whitespace-pre-wrap">
+                  {emailPreview}
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 mb-2">Corrected Text:</label>
+                <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3 text-sm text-slate-700 whitespace-pre-wrap">
+                  {correctedText}
+                </div>
+              </div>
+            </div>
+
+            <div className="px-6 py-4 border-t border-slate-200 flex justify-end gap-3">
+              <button
+                onClick={() => {
+                  setShowCorrectionModal(false);
+                  setCorrectedText('');
+                }}
+                className="px-4 py-2 bg-slate-200 text-slate-700 rounded-lg hover:bg-slate-300 transition-all font-semibold text-sm"
+              >
+                Keep Original
+              </button>
+              <button
+                onClick={handleAcceptCorrection}
+                className="px-4 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 transition-all font-bold text-sm flex items-center gap-2"
+              >
+                Accept Corrections
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
