@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import type { Database } from '../lib/database.types';
-import { Plus, Edit2, Trash2, Save, X, Info, Code2, Eye } from 'lucide-react';
+import { Plus, Edit2, Trash2, Save, X, Info, Code2, Eye, Upload, File, FileText } from 'lucide-react';
 import ReactQuill from 'react-quill';
 import 'react-quill/dist/quill.snow.css';
 
 type EmailTemplate = Database['public']['Tables']['email_templates']['Row'];
+type TemplateAttachment = Database['public']['Tables']['template_attachments']['Row'];
 
 interface TemplateFormData {
   name: string;
@@ -16,8 +17,17 @@ interface TemplateFormData {
   is_active: boolean;
 }
 
+interface AttachmentWithJunction extends TemplateAttachment {
+  junction_id?: string;
+}
+
+interface TemplateWithAttachments extends EmailTemplate {
+  attachment_count?: number;
+  attachments?: TemplateAttachment[];
+}
+
 export function TemplateAdmin() {
-  const [templates, setTemplates] = useState<EmailTemplate[]>([]);
+  const [templates, setTemplates] = useState<TemplateWithAttachments[]>([]);
   const [loading, setLoading] = useState(true);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState(false);
@@ -33,6 +43,8 @@ export function TemplateAdmin() {
   const [isHtmlMode, setIsHtmlMode] = useState(false);
   const [showHtmlPreview, setShowHtmlPreview] = useState(false);
   const [htmlEditorMode, setHtmlEditorMode] = useState<'visual' | 'code'>('visual');
+  const [attachments, setAttachments] = useState<AttachmentWithJunction[]>([]);
+  const [uploadingFile, setUploadingFile] = useState(false);
 
   useEffect(() => {
     loadTemplates();
@@ -42,11 +54,36 @@ export function TemplateAdmin() {
     try {
       const { data, error } = await supabase
         .from('email_templates')
-        .select('*')
+        .select(`
+          *,
+          email_template_attachments (
+            id,
+            template_attachments (
+              id,
+              filename,
+              display_name,
+              file_size,
+              content_type
+            )
+          )
+        `)
         .order('created_at', { ascending: false });
 
       if (error) throw error;
-      setTemplates(data || []);
+
+      const templatesWithAttachments = (data || []).map((template: any) => {
+        const attachments = (template.email_template_attachments || [])
+          .map((eta: any) => eta.template_attachments)
+          .filter((att: any) => att !== null);
+
+        return {
+          ...template,
+          attachment_count: attachments.length,
+          attachments: attachments,
+        };
+      });
+
+      setTemplates(templatesWithAttachments);
     } catch (error) {
       console.error('Error loading templates:', error);
     } finally {
@@ -68,9 +105,10 @@ export function TemplateAdmin() {
     setIsHtmlMode(false);
     setShowHtmlPreview(false);
     setHtmlEditorMode('visual');
+    setAttachments([]);
   }
 
-  function startEditing(template: EmailTemplate) {
+  async function startEditing(template: EmailTemplate) {
     setEditingId(template.id);
     setIsCreating(false);
     setFormData({
@@ -84,6 +122,7 @@ export function TemplateAdmin() {
     setIsHtmlMode(!!((template as any).html_body_template));
     setShowHtmlPreview(false);
     setHtmlEditorMode('visual');
+    await loadAttachments(template.id);
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }
 
@@ -101,6 +140,134 @@ export function TemplateAdmin() {
     setIsHtmlMode(false);
     setShowHtmlPreview(false);
     setHtmlEditorMode('visual');
+    setAttachments([]);
+  }
+
+  async function loadAttachments(templateId: string) {
+    try {
+      const { data, error } = await supabase
+        .from('email_template_attachments')
+        .select(`
+          id,
+          attachment_id,
+          template_attachments (
+            id,
+            filename,
+            display_name,
+            file_size,
+            content_type,
+            storage_path,
+            description
+          )
+        `)
+        .eq('template_id', templateId);
+
+      if (error) throw error;
+
+      const attachmentsData = (data || []).map((item: any) => ({
+        ...item.template_attachments,
+        junction_id: item.id,
+      }));
+
+      setAttachments(attachmentsData);
+    } catch (error) {
+      console.error('Error loading attachments:', error);
+    }
+  }
+
+  async function handleFileUpload(event: React.ChangeEvent<HTMLInputElement>) {
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+
+    const file = files[0];
+    const maxSize = 10 * 1024 * 1024;
+
+    if (file.size > maxSize) {
+      alert('File size must be less than 10MB');
+      return;
+    }
+
+    setUploadingFile(true);
+
+    try {
+      const fileExt = file.name.split('.').pop();
+      const fileName = `${Date.now()}_${Math.random().toString(36).substring(7)}.${fileExt}`;
+      const filePath = `${fileName}`;
+
+      const { error: uploadError } = await supabase.storage
+        .from('template-attachments')
+        .upload(filePath, file);
+
+      if (uploadError) throw uploadError;
+
+      const { data: attachmentData, error: insertError } = await supabase
+        .from('template_attachments')
+        .insert([
+          {
+            filename: file.name,
+            display_name: file.name,
+            file_size: file.size,
+            content_type: file.type,
+            storage_path: filePath,
+          },
+        ])
+        .select()
+        .single();
+
+      if (insertError) throw insertError;
+
+      if (editingId) {
+        const { error: junctionError } = await supabase
+          .from('email_template_attachments')
+          .insert([
+            {
+              template_id: editingId,
+              attachment_id: attachmentData.id,
+              order_index: attachments.length,
+            },
+          ]);
+
+        if (junctionError) throw junctionError;
+        await loadAttachments(editingId);
+      } else {
+        setAttachments([...attachments, attachmentData]);
+      }
+    } catch (error) {
+      console.error('Error uploading file:', error);
+      alert('Failed to upload file');
+    } finally {
+      setUploadingFile(false);
+      event.target.value = '';
+    }
+  }
+
+  async function removeAttachment(attachment: AttachmentWithJunction) {
+    if (!confirm(`Remove "${attachment.filename}" from this template?`)) {
+      return;
+    }
+
+    try {
+      if (editingId && attachment.junction_id) {
+        const { error } = await supabase
+          .from('email_template_attachments')
+          .delete()
+          .eq('id', attachment.junction_id);
+
+        if (error) throw error;
+        await loadAttachments(editingId);
+      } else {
+        setAttachments(attachments.filter((a) => a.id !== attachment.id));
+      }
+    } catch (error) {
+      console.error('Error removing attachment:', error);
+      alert('Failed to remove attachment');
+    }
+  }
+
+  function formatFileSize(bytes: number): string {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
   }
 
   const quillModules = {
@@ -133,11 +300,27 @@ export function TemplateAdmin() {
   async function saveTemplate() {
     try {
       if (isCreating) {
-        const { error } = await supabase
+        const { data: newTemplate, error } = await supabase
           .from('email_templates')
-          .insert([formData]);
+          .insert([formData])
+          .select()
+          .single();
 
         if (error) throw error;
+
+        if (attachments.length > 0 && newTemplate) {
+          const junctionRecords = attachments.map((attachment, index) => ({
+            template_id: newTemplate.id,
+            attachment_id: attachment.id,
+            order_index: index,
+          }));
+
+          const { error: junctionError } = await supabase
+            .from('email_template_attachments')
+            .insert(junctionRecords);
+
+          if (junctionError) throw junctionError;
+        }
       } else if (editingId) {
         const { error } = await supabase
           .from('email_templates')
@@ -384,6 +567,78 @@ export function TemplateAdmin() {
                 )}
               </div>
 
+              <div>
+                <label className="block text-sm font-semibold text-slate-700 mb-2">
+                  Attachments
+                </label>
+                <div className="border-2 border-dashed border-slate-300 rounded-lg p-6 bg-slate-50">
+                  <div className="flex flex-col items-center gap-3">
+                    <Upload className="w-8 h-8 text-slate-400" />
+                    <div className="text-center">
+                      <label
+                        htmlFor="file-upload"
+                        className="cursor-pointer text-sky-600 hover:text-sky-700 font-semibold"
+                      >
+                        Click to upload
+                      </label>
+                      <span className="text-slate-600"> or drag and drop</span>
+                      <p className="text-xs text-slate-500 mt-1">
+                        PDF, Word, Excel, Images (max 10MB)
+                      </p>
+                    </div>
+                    <input
+                      id="file-upload"
+                      type="file"
+                      onChange={handleFileUpload}
+                      disabled={uploadingFile}
+                      className="hidden"
+                      accept=".pdf,.doc,.docx,.xls,.xlsx,.png,.jpg,.jpeg,.gif"
+                    />
+                  </div>
+
+                  {uploadingFile && (
+                    <div className="mt-4 flex items-center justify-center gap-2 text-sky-600">
+                      <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-sky-600"></div>
+                      <span className="text-sm font-medium">Uploading...</span>
+                    </div>
+                  )}
+
+                  {attachments.length > 0 && (
+                    <div className="mt-4 space-y-2">
+                      {attachments.map((attachment) => (
+                        <div
+                          key={attachment.id}
+                          className="flex items-center justify-between p-3 bg-white rounded-lg border border-slate-200"
+                        >
+                          <div className="flex items-center gap-3">
+                            {attachment.content_type.includes('pdf') ? (
+                              <FileText className="w-5 h-5 text-red-500" />
+                            ) : (
+                              <File className="w-5 h-5 text-slate-500" />
+                            )}
+                            <div>
+                              <p className="text-sm font-semibold text-slate-900">
+                                {attachment.display_name || attachment.filename}
+                              </p>
+                              <p className="text-xs text-slate-500">
+                                {formatFileSize(attachment.file_size)}
+                              </p>
+                            </div>
+                          </div>
+                          <button
+                            onClick={() => removeAttachment(attachment)}
+                            className="p-2 text-red-600 hover:bg-red-50 rounded-lg transition-all"
+                            title="Remove attachment"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+
               <div className="flex items-center">
                 <input
                   type="checkbox"
@@ -449,6 +704,12 @@ export function TemplateAdmin() {
                         HTML
                       </span>
                     )}
+                    {template.attachment_count && template.attachment_count > 0 && (
+                      <span className="px-2.5 py-1 text-xs font-bold bg-amber-100 text-amber-700 rounded-full border border-amber-200 flex items-center gap-1">
+                        <File className="w-3 h-3" />
+                        {template.attachment_count}
+                      </span>
+                    )}
                   </div>
                   <div className="text-sm text-slate-600 mb-3">
                     <span className="font-semibold">Subject:</span> {template.subject_template}
@@ -488,6 +749,34 @@ export function TemplateAdmin() {
                   </pre>
                 )}
               </div>
+
+              {template.attachments && template.attachments.length > 0 && (
+                <div className="mt-4">
+                  <p className="text-xs text-slate-500 font-semibold mb-2">Attachments:</p>
+                  <div className="space-y-2">
+                    {template.attachments.map((attachment) => (
+                      <div
+                        key={attachment.id}
+                        className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg border border-slate-200"
+                      >
+                        {attachment.content_type.includes('pdf') ? (
+                          <FileText className="w-5 h-5 text-red-500 flex-shrink-0" />
+                        ) : (
+                          <File className="w-5 h-5 text-slate-500 flex-shrink-0" />
+                        )}
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-semibold text-slate-900 truncate">
+                            {attachment.display_name || attachment.filename}
+                          </p>
+                          <p className="text-xs text-slate-500">
+                            {formatFileSize(attachment.file_size)}
+                          </p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           ))}
 

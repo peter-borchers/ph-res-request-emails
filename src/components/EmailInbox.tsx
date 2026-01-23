@@ -5,9 +5,11 @@ import { Mail, Calendar, Users, Bed, ArrowDownLeft, ArrowUpRight, Sparkles, Refr
 
 type Conversation = Database['public']['Tables']['msgraph_conversations']['Row'];
 type Reservation = Database['public']['Tables']['reservations']['Row'];
+type RoomProposal = Database['public']['Tables']['room_proposals']['Row'];
 
 interface ConversationWithDetails extends Conversation {
   reservation?: Reservation;
+  room_proposals?: RoomProposal[];
   message_count?: number;
   unread_count?: number;
   sender_name?: string;
@@ -83,9 +85,20 @@ export function EmailInbox({ selectedEmailId, onSelectEmail, refreshTrigger }: E
             .eq('conversation_id', conversation.conversation_id)
             .maybeSingle();
 
+          let roomProposals: RoomProposal[] = [];
+          if (reservation) {
+            const { data } = await supabase
+              .from('room_proposals')
+              .select('*')
+              .eq('reservation_id', reservation.id)
+              .order('display_order', { ascending: true });
+            roomProposals = data || [];
+          }
+
           return {
             ...conversation,
             reservation: reservation || undefined,
+            room_proposals: roomProposals,
             message_count: messageCount,
             unread_count: unreadCount,
             sender_email: senderEmail,
@@ -270,7 +283,7 @@ export function EmailInbox({ selectedEmailId, onSelectEmail, refreshTrigger }: E
                 </div>
               </div>
 
-              {reservation && (reservation.arrival_date || reservation.departure_date || reservation.adults > 0 || (reservation.room_types && reservation.room_types.length > 0)) ? (
+              {reservation ? (
                 <div className="space-y-2 bg-slate-50 rounded-lg p-2.5 border border-slate-200">
                   {reservation.arrival_date && reservation.departure_date && (
                     <div className="flex items-center gap-2 text-xs">
@@ -295,20 +308,14 @@ export function EmailInbox({ selectedEmailId, onSelectEmail, refreshTrigger }: E
                     </div>
                   )}
 
-                  {reservation.room_types && reservation.room_types.length > 0 && (
-                    <div className="flex items-start gap-2 text-xs">
-                      <Bed className="w-3.5 h-3.5 text-slate-500 mt-0.5 flex-shrink-0" />
-                      <div className="flex-1">
-                        <div className="text-slate-700 flex flex-wrap gap-1">
-                          {reservation.room_types.map((roomType, idx) => (
-                            <span key={idx} className="bg-white text-slate-800 px-2 py-0.5 rounded-md font-semibold border border-slate-300 shadow-sm">
-                              {roomType}
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-                    </div>
-                  )}
+                  <div className="flex items-center gap-2 text-xs">
+                    <Bed className="w-3.5 h-3.5 text-slate-500 flex-shrink-0" />
+                    <span className="text-slate-700 font-medium">
+                      {conversation.room_proposals && conversation.room_proposals.length > 0
+                        ? `${conversation.room_proposals.length} room${conversation.room_proposals.length !== 1 ? 's' : ''} & rate${conversation.room_proposals.length !== 1 ? 's' : ''} proposal${conversation.room_proposals.length !== 1 ? 's' : ''}`
+                        : 'No rooms & rates proposed'}
+                    </span>
+                  </div>
                 </div>
               ) : (
                 <div className="text-xs text-slate-500 italic py-2 bg-slate-50 rounded px-2 border border-slate-200">

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import type { Database } from '../lib/database.types';
-import { Calendar, Users, Send, Mail, MessageSquare, RefreshCw, ChevronDown, ChevronUp, History, ExternalLink, Code2, Eye } from 'lucide-react';
+import { Calendar, Users, Send, Mail, MessageSquare, RefreshCw, ChevronDown, ChevronUp, History, ExternalLink, Code2, Eye, Plus, Trash2, Edit, File, FileText, Paperclip, Upload } from 'lucide-react';
 import ReactQuill from 'react-quill';
 import 'react-quill/dist/quill.snow.css';
 
@@ -10,6 +10,8 @@ type Message = Database['public']['Tables']['msgraph_messages']['Row'];
 type Reservation = Database['public']['Tables']['reservations']['Row'];
 type EmailTemplate = Database['public']['Tables']['email_templates']['Row'];
 type RoomType = Database['public']['Tables']['room_types']['Row'];
+type RoomProposal = Database['public']['Tables']['room_proposals']['Row'];
+type TemplateAttachment = Database['public']['Tables']['template_attachments']['Row'];
 
 interface SelectedRoom {
   code: string;
@@ -60,6 +62,18 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
   const [correctedText, setCorrectedText] = useState<string>('');
   const [isHtmlTemplate, setIsHtmlTemplate] = useState(false);
   const [htmlEditorMode, setHtmlEditorMode] = useState<'visual' | 'code'>('visual');
+  const [roomProposals, setRoomProposals] = useState<RoomProposal[]>([]);
+  const [showProposalModal, setShowProposalModal] = useState(false);
+  const [editingProposal, setEditingProposal] = useState<RoomProposal | null>(null);
+  const [proposalRooms, setProposalRooms] = useState<SelectedRoom[]>([]);
+  const [proposalName, setProposalName] = useState<string>('');
+  const [emailAttachments, setEmailAttachments] = useState<TemplateAttachment[]>([]);
+  const [uploadingAttachment, setUploadingAttachment] = useState(false);
+  const [toRecipients, setToRecipients] = useState<string[]>([]);
+  const [ccRecipients, setCcRecipients] = useState<string[]>([]);
+  const [newToEmail, setNewToEmail] = useState<string>('');
+  const [newCcEmail, setNewCcEmail] = useState<string>('');
+  const [messageAttachments, setMessageAttachments] = useState<Map<string, TemplateAttachment[]>>(new Map());
 
   useEffect(() => {
     loadTemplates();
@@ -123,6 +137,12 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
   }, [conversation]);
 
   useEffect(() => {
+    if (reservationId) {
+      loadRoomProposals(reservationId);
+    }
+  }, [reservationId]);
+
+  useEffect(() => {
     if (messages.length > 0 && !expandedMessageId) {
       setExpandedMessageId(messages[messages.length - 1].id);
     }
@@ -130,7 +150,23 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
 
   useEffect(() => {
     generateEmailPreview();
-  }, [reservation, selectedTemplate, templates, selectedRooms]);
+  }, [reservation, selectedTemplate, templates, selectedRooms, roomProposals]);
+
+  useEffect(() => {
+    loadTemplateAttachments();
+  }, [selectedTemplate, templates]);
+
+  useEffect(() => {
+    if (showCompose && toRecipients.length === 0) {
+      initializeRecipients();
+    }
+  }, [showCompose, conversation, messages]);
+
+  useEffect(() => {
+    if (conversation && reservationId) {
+      loadMessageAttachments(conversation.id);
+    }
+  }, [conversation, reservationId, messages]);
 
   const quillModules = {
     toolbar: [
@@ -162,7 +198,20 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
   async function loadTemplates() {
     const { data } = await supabase
       .from('email_templates')
-      .select('*')
+      .select(`
+        *,
+        email_template_attachments (
+          id,
+          template_attachments (
+            id,
+            filename,
+            display_name,
+            file_size,
+            content_type,
+            storage_path
+          )
+        )
+      `)
       .eq('is_active', true)
       .order('name');
 
@@ -193,6 +242,232 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
     }
   }
 
+  async function loadRoomProposals(resId: string) {
+    const { data } = await supabase
+      .from('room_proposals')
+      .select('*')
+      .eq('reservation_id', resId)
+      .order('display_order');
+
+    if (data) {
+      setRoomProposals(data);
+    }
+  }
+
+  function loadTemplateAttachments() {
+    if (!selectedTemplate || templates.length === 0) {
+      setEmailAttachments([]);
+      return;
+    }
+
+    const template = templates.find(t => t.id === selectedTemplate);
+    if (template && (template as any).email_template_attachments) {
+      const attachments = (template as any).email_template_attachments
+        .map((eta: any) => eta.template_attachments)
+        .filter((att: any) => att !== null);
+      setEmailAttachments(attachments);
+    } else {
+      setEmailAttachments([]);
+    }
+  }
+
+  async function handleAttachmentUpload(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    setUploadingAttachment(true);
+    try {
+      // Generate unique file path with timestamp
+      const timestamp = Date.now();
+      const fileExt = file.name.split('.').pop();
+      const fileName = file.name.replace(/\.[^/.]+$/, ''); // Remove extension
+      const storagePath = `${timestamp}-${fileName}.${fileExt}`;
+
+      // Upload to Supabase Storage
+      const { error: uploadError } = await supabase.storage
+        .from('template-attachments')
+        .upload(storagePath, file, {
+          contentType: file.type || 'application/octet-stream',
+          upsert: false,
+        });
+
+      if (uploadError) {
+        console.error('Storage upload error:', uploadError);
+        throw new Error(`Upload failed: ${uploadError.message}`);
+      }
+
+      // Store metadata in database
+      const { data: attachment, error: dbError } = await supabase
+        .from('template_attachments')
+        .insert({
+          filename: file.name,
+          display_name: file.name,
+          file_size: file.size,
+          content_type: file.type || 'application/octet-stream',
+          storage_path: storagePath,
+        })
+        .select()
+        .single();
+
+      if (dbError) {
+        // Clean up uploaded file if database insert fails
+        await supabase.storage.from('template-attachments').remove([storagePath]);
+        console.error('Database error:', dbError);
+        throw new Error(`Database error: ${dbError.message}`);
+      }
+
+      if (attachment) {
+        setEmailAttachments([...emailAttachments, attachment]);
+      }
+    } catch (error) {
+      console.error('Error uploading attachment:', error);
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+      alert(`Failed to upload file: ${errorMessage}`);
+    } finally {
+      setUploadingAttachment(false);
+      event.target.value = '';
+    }
+  }
+
+  function removeEmailAttachment(attachmentId: string) {
+    setEmailAttachments(emailAttachments.filter(a => a.id !== attachmentId));
+  }
+
+  function formatFileSize(bytes: number): string {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  }
+
+  function initializeRecipients() {
+    const recipientEmail = reservation.guest_email || messages[0]?.from_email;
+    if (recipientEmail && !toRecipients.includes(recipientEmail)) {
+      setToRecipients([recipientEmail]);
+    }
+  }
+
+  function addToRecipient() {
+    const email = newToEmail.trim();
+    if (email && !toRecipients.includes(email)) {
+      if (isValidEmail(email)) {
+        setToRecipients([...toRecipients, email]);
+        setNewToEmail('');
+      } else {
+        alert('Please enter a valid email address');
+      }
+    }
+  }
+
+  function removeToRecipient(email: string) {
+    setToRecipients(toRecipients.filter(e => e !== email));
+  }
+
+  function addCcRecipient() {
+    const email = newCcEmail.trim();
+    if (email && !ccRecipients.includes(email)) {
+      if (isValidEmail(email)) {
+        setCcRecipients([...ccRecipients, email]);
+        setNewCcEmail('');
+      } else {
+        alert('Please enter a valid email address');
+      }
+    }
+  }
+
+  function removeCcRecipient(email: string) {
+    setCcRecipients(ccRecipients.filter(e => e !== email));
+  }
+
+  function isValidEmail(email: string): boolean {
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    return emailRegex.test(email);
+  }
+
+  function openAddProposalModal() {
+    setEditingProposal(null);
+    setProposalName('');
+    setProposalRooms([]);
+    setShowProposalModal(true);
+  }
+
+  function openEditProposalModal(proposal: RoomProposal) {
+    setEditingProposal(proposal);
+    setProposalName(proposal.proposal_name);
+    setProposalRooms(proposal.rooms as SelectedRoom[]);
+    setShowProposalModal(true);
+  }
+
+  async function saveProposal() {
+    if (!reservationId || proposalRooms.length === 0) {
+      alert('Please add at least one room to the proposal');
+      return;
+    }
+
+    const proposalData = {
+      reservation_id: reservationId,
+      proposal_name: proposalName || `Option ${roomProposals.length + 1}`,
+      rooms: proposalRooms,
+      display_order: editingProposal?.display_order ?? roomProposals.length
+    };
+
+    if (editingProposal) {
+      await supabase
+        .from('room_proposals')
+        .update(proposalData)
+        .eq('id', editingProposal.id);
+    } else {
+      await supabase
+        .from('room_proposals')
+        .insert(proposalData);
+    }
+
+    await loadRoomProposals(reservationId);
+    setShowProposalModal(false);
+    setProposalName('');
+    setProposalRooms([]);
+    setEditingProposal(null);
+  }
+
+  async function deleteProposal(proposalId: string) {
+    if (!confirm('Are you sure you want to delete this proposal?')) return;
+
+    await supabase
+      .from('room_proposals')
+      .delete()
+      .eq('id', proposalId);
+
+    if (reservationId) {
+      await loadRoomProposals(reservationId);
+    }
+  }
+
+  function toggleProposalRoom(roomType: RoomType) {
+    const isSelected = proposalRooms.some(r => r.code === roomType.code);
+
+    if (isSelected) {
+      setProposalRooms(proposalRooms.filter(r => r.code !== roomType.code));
+    } else {
+      setProposalRooms([...proposalRooms, {
+        code: roomType.code,
+        name: roomType.name,
+        quantity: 1,
+        nightly_rate: 0
+      }]);
+    }
+  }
+
+  function updateProposalRoomQuantity(code: string, quantity: number) {
+    setProposalRooms(proposalRooms.map(room =>
+      room.code === code ? { ...room, quantity: Math.max(1, quantity) } : room
+    ));
+  }
+
+  function updateProposalRoomRate(code: string, rate: number) {
+    setProposalRooms(proposalRooms.map(room =>
+      room.code === code ? { ...room, nightly_rate: Math.max(0, rate) } : room
+    ));
+  }
+
   async function loadMessageHistory(conversationUuid: string) {
     const { data } = await supabase
       .from('msgraph_messages')
@@ -202,6 +477,42 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
 
     if (data) {
       setMessages(data);
+      loadMessageAttachments(conversationUuid);
+    }
+  }
+
+  async function loadMessageAttachments(conversationUuid: string) {
+    if (!reservationId) return;
+
+    const { data, error } = await supabase
+      .from('message_attachments')
+      .select(`
+        *,
+        template_attachments (
+          id,
+          filename,
+          display_name,
+          file_size,
+          content_type,
+          storage_path
+        )
+      `)
+      .eq('reservation_id', reservationId);
+
+    if (!error && data) {
+      const attachmentsByMessage = new Map<string, TemplateAttachment[]>();
+
+      data.forEach((msgAttachment: any) => {
+        if (msgAttachment.template_attachments) {
+          const existing = attachmentsByMessage.get(msgAttachment.reservation_id) || [];
+          attachmentsByMessage.set(
+            msgAttachment.reservation_id,
+            [...existing, msgAttachment.template_attachments]
+          );
+        }
+      });
+
+      setMessageAttachments(attachmentsByMessage);
     }
   }
 
@@ -509,21 +820,28 @@ ${message.body_content || message.body_preview}`
       ? Math.ceil((new Date(departureDate).getTime() - new Date(arrivalDate).getTime()) / (1000 * 60 * 60 * 24))
       : 0;
 
-    const roomSummary = selectedRooms.length > 0
-      ? selectedRooms.map(room => `${room.quantity}x ${room.name} (${room.code})`).join(', ')
-      : 'No rooms selected';
+    let roomDetailsText = '';
+    if (roomProposals.length > 0) {
+      roomDetailsText = roomProposals.map((proposal, idx) => {
+        const proposalRooms = proposal.rooms as SelectedRoom[];
+        const totalRoomRate = proposalRooms.reduce((total, room) =>
+          total + (room.quantity * room.nightly_rate), 0
+        );
+        const totalCost = totalRoomRate * nights;
 
-    const roomDetails = selectedRooms.length > 0
-      ? selectedRooms.map(room =>
-          `${room.quantity}x ${room.name} (${room.code}) - R${room.nightly_rate} per night`
-        ).join('\n')
-      : 'No rooms selected';
+        const roomsList = proposalRooms.map(room =>
+          `  ${room.quantity}x ${room.name} (${room.code}) - R${room.nightly_rate} per night`
+        ).join('\n');
 
-    const totalRoomRate = selectedRooms.reduce((total, room) =>
-      total + (room.quantity * room.nightly_rate), 0
-    );
+        return `${proposal.proposal_name}:\n${roomsList}\n  Total per night: R${totalRoomRate}\n  Total for ${nights} nights: R${totalCost}`;
+      }).join('\n\n');
+    } else {
+      roomDetailsText = 'No room proposals yet';
+    }
 
-    const totalReservationCost = totalRoomRate * nights;
+    const roomSummary = roomProposals.length > 0
+      ? `${roomProposals.length} option${roomProposals.length > 1 ? 's' : ''} available`
+      : 'No rooms proposed';
 
     let preview = hasHtml ? (template as any).html_body_template : template.body_template;
 
@@ -534,10 +852,8 @@ ${message.body_content || message.body_preview}`
     preview = preview.replace(/\{\{adults\}\}/g, String(reservation.adults || 0));
     preview = preview.replace(/\{\{children\}\}/g, String(reservation.children || 0));
     preview = preview.replace(/\{\{room_types\}\}/g, roomSummary);
-    preview = preview.replace(/\{\{room_details\}\}/g, roomDetails);
-    preview = preview.replace(/\{\{rate_amount\}\}/g, `R${totalRoomRate}`);
+    preview = preview.replace(/\{\{room_details\}\}/g, roomDetailsText);
     preview = preview.replace(/\{\{total_nights\}\}/g, String(nights));
-    preview = preview.replace(/\{\{total_cost\}\}/g, `R${totalReservationCost}`);
 
     setEmailPreview(preview);
     setHasManualEdit(false);
@@ -602,7 +918,12 @@ ${message.body_content || message.body_preview}`
   }
 
   async function handleSendEmail() {
-    if (!conversation || !messages.length) return;
+    if (!conversation || !messages.length || !reservationId) return;
+
+    if (toRecipients.length === 0) {
+      alert('Please add at least one recipient');
+      return;
+    }
 
     const { data: settings } = await supabase
       .from('settings')
@@ -615,8 +936,10 @@ ${message.body_content || message.body_preview}`
       return;
     }
 
+    const template = templates.find(t => t.id === selectedTemplate);
+
     try {
-      const apiUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/msgraph/reply`;
+      const apiUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/send-email`;
       const response = await fetch(apiUrl, {
         method: 'POST',
         headers: {
@@ -624,14 +947,20 @@ ${message.body_content || message.body_preview}`
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          message_id: messages[0].msgraph_message_id,
-          body: emailPreview,
-          is_html: isHtmlTemplate,
-          mailbox_address: mailboxAddressFromSettings
+          reservationId,
+          conversationId: conversation.conversation_id,
+          toRecipients,
+          ccRecipients,
+          subject: template?.subject_template.replace(/\{\{guest_name\}\}/g, reservation.guest_name || '') || 'Booking Information',
+          bodyHtml: isHtmlTemplate ? emailPreview : undefined,
+          bodyText: isHtmlTemplate ? undefined : emailPreview,
+          templateId: selectedTemplate,
+          attachmentIds: emailAttachments.map(a => a.id)
         }),
       });
 
       if (response.ok) {
+        alert('Email sent successfully!');
         setShowCompose(false);
 
         setTimeout(async () => {
@@ -697,27 +1026,14 @@ ${message.body_content || message.body_preview}`
           {/* Guest & Stay Details Grid */}
           <div className="grid grid-cols-12 gap-4">
             {/* Guest Info */}
-            <div className="col-span-2 space-y-2">
-              <div>
-                <label className="block text-xs font-semibold text-slate-600 mb-1">Guest Name</label>
-                <input
-                  type="text"
-                  value={reservation.guest_name || ''}
-                  onChange={(e) => updateReservation({ guest_name: e.target.value })}
-                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-sky-500 focus:border-sky-500 transition-all text-sm"
-                />
-              </div>
-              {bookingUrlTemplate && (
-                <a
-                  href={generateBookingUrl()}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="flex items-center justify-center gap-2 px-2.5 py-1.5 bg-sky-600 text-white rounded-lg hover:bg-sky-700 transition-all text-xs font-semibold shadow-sm w-full"
-                >
-                  <ExternalLink className="w-3.5 h-3.5" />
-                  Search Availability Online
-                </a>
-              )}
+            <div className="col-span-2">
+              <label className="block text-xs font-semibold text-slate-600 mb-1">Guest Name</label>
+              <input
+                type="text"
+                value={reservation.guest_name || ''}
+                onChange={(e) => updateReservation({ guest_name: e.target.value })}
+                className="w-full px-2.5 py-1.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-sky-500 focus:border-sky-500 transition-all text-sm"
+              />
             </div>
 
             {/* Arrival Date */}
@@ -778,67 +1094,94 @@ ${message.body_content || message.body_preview}`
               />
             </div>
 
-            {/* Summary */}
-            <div className="col-span-3">
-              <div className="bg-slate-50 rounded-lg p-2.5 border border-slate-200 h-full flex flex-col justify-center">
-                <div className="text-xs font-semibold text-slate-600 mb-0.5">Stay Summary</div>
-                <div className="text-base font-bold text-slate-900">{calculateNights()} Nights</div>
-                <div className="text-xs text-slate-600 mt-0.5">
-                  {reservation.adults || 0} Adult{(reservation.adults || 0) !== 1 ? 's' : ''}
-                  {(reservation.children || 0) > 0 && `, ${reservation.children} Child${reservation.children !== 1 ? 'ren' : ''}`}
-                </div>
+            {/* Search Availability Button */}
+            {bookingUrlTemplate && (
+              <div className="col-span-3 flex items-end">
+                <a
+                  href={generateBookingUrl()}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center justify-center gap-2 px-3 py-1.5 bg-sky-600 text-white rounded-lg hover:bg-sky-700 transition-all text-xs font-semibold shadow-sm w-full"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  Search Availability Online
+                </a>
               </div>
-            </div>
+            )}
           </div>
 
-          {/* Room Selection */}
+          {/* Room Proposals */}
           <div className="mt-3">
-            <label className="block text-xs font-semibold text-slate-600 mb-1.5">Room Types</label>
-            <div className="flex flex-wrap gap-2">
-              {roomTypes.map((roomType) => (
-                <button
-                  key={roomType.code}
-                  onClick={() => toggleRoomSelection(roomType)}
-                  className={`px-2.5 py-1 border rounded-lg font-semibold text-xs transition-all ${
-                    selectedRooms.some(r => r.code === roomType.code)
-                      ? 'bg-sky-600 text-white border-sky-600 shadow-sm'
-                      : 'bg-white text-slate-700 border-slate-300 hover:border-sky-400 hover:text-sky-600'
-                  }`}
-                  title={roomType.name}
-                >
-                  {roomType.code}
-                </button>
-              ))}
+            <div className="flex justify-between items-center mb-2">
+              <label className="block text-xs font-semibold text-slate-600">Room/Rate Proposals</label>
+              <button
+                onClick={openAddProposalModal}
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-sky-600 text-white rounded-lg hover:bg-sky-700 transition-all font-semibold text-xs shadow-sm"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                Add Room/Rate Proposal
+              </button>
             </div>
 
-            {selectedRooms.length > 0 && (
-              <div className="mt-2 flex flex-wrap gap-2">
-                {selectedRooms.map((room) => (
-                  <div key={room.code} className="bg-slate-50 rounded-lg border border-slate-200 p-2 flex items-center gap-2">
-                    <div className="font-semibold text-slate-900 text-sm">{room.code}</div>
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="number"
-                        min="1"
-                        value={room.quantity}
-                        onChange={(e) => updateRoomQuantity(room.code, parseInt(e.target.value) || 1)}
-                        className="w-14 px-2 py-1 border border-slate-300 rounded text-sm"
-                        placeholder="Qty"
-                      />
-                      <span className="text-slate-600 text-xs">×</span>
-                      <input
-                        type="number"
-                        min="0"
-                        step="0.01"
-                        value={room.nightly_rate}
-                        onChange={(e) => updateRoomRate(room.code, parseFloat(e.target.value) || 0)}
-                        className="w-20 px-2 py-1 border border-slate-300 rounded text-sm"
-                        placeholder="Rate"
-                      />
-                      <span className="text-slate-600 text-xs">ZAR/night</span>
+            {roomProposals.length > 0 ? (
+              <div className="space-y-2">
+                {roomProposals.map((proposal) => {
+                  const proposalRooms = proposal.rooms as SelectedRoom[];
+                  const arrivalDate = reservation.arrival_date || '';
+                  const departureDate = reservation.departure_date || '';
+                  const nights = arrivalDate && departureDate
+                    ? Math.ceil((new Date(departureDate).getTime() - new Date(arrivalDate).getTime()) / (1000 * 60 * 60 * 24))
+                    : 0;
+                  const totalRoomRate = proposalRooms.reduce((total, room) =>
+                    total + (room.quantity * room.nightly_rate), 0
+                  );
+                  const totalCost = totalRoomRate * nights;
+
+                  return (
+                    <div key={proposal.id} className="bg-white rounded-lg border border-slate-300 p-3 shadow-sm">
+                      <div className="flex justify-between items-start mb-2">
+                        <h4 className="font-bold text-slate-900 text-sm">{proposal.proposal_name}</h4>
+                        <div className="flex gap-1">
+                          <button
+                            onClick={() => openEditProposalModal(proposal)}
+                            className="p-1 text-slate-600 hover:text-sky-600 transition-all"
+                            title="Edit proposal"
+                          >
+                            <Edit className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            onClick={() => deleteProposal(proposal.id)}
+                            className="p-1 text-slate-600 hover:text-red-600 transition-all"
+                            title="Delete proposal"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                      <div className="space-y-1">
+                        {proposalRooms.map((room) => (
+                          <div key={room.code} className="flex items-center gap-2 text-sm">
+                            <span className="font-semibold text-slate-900">{room.code}</span>
+                            <span className="text-slate-600">-</span>
+                            <span className="text-slate-700">{room.quantity}x {room.name}</span>
+                            <span className="text-slate-600">@</span>
+                            <span className="font-semibold text-slate-900">R{room.nightly_rate}/night</span>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="mt-2 pt-2 border-t border-slate-200 flex justify-between items-center text-xs">
+                        <span className="text-slate-600">Per night: <span className="font-bold text-slate-900">R{totalRoomRate}</span></span>
+                        {nights > 0 && (
+                          <span className="text-slate-600">Total ({nights} nights): <span className="font-bold text-emerald-700">R{totalCost}</span></span>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="text-center py-4 text-slate-400 text-sm">
+                No room proposals yet. Click "Add Room/Rate Proposal" to create one.
               </div>
             )}
           </div>
@@ -897,39 +1240,34 @@ ${message.body_content || message.body_preview}`
                   >
                     <div className="flex justify-between items-start gap-4">
                       <div className="flex-1">
-                        <div className="flex items-center gap-2 mb-2">
-                          {isLatest && !isOutgoing && (
-                            <span className="px-2 py-0.5 text-xs font-bold bg-amber-100 text-amber-700 rounded border border-amber-200">
-                              Latest
-                            </span>
-                          )}
-                          {isOutgoing && (
-                            <span className="px-2 py-0.5 text-xs font-bold bg-emerald-200 text-emerald-800 rounded border border-emerald-300">
-                              You
-                            </span>
-                          )}
-                        </div>
-
                         <div className="space-y-1 mb-2">
-                          <div className="flex items-start gap-2">
-                            <span className="text-xs font-bold text-slate-600 min-w-[35px]">From:</span>
-                            <div className="flex-1">
-                              <div className="font-bold text-slate-900 text-sm">{msg.from_name}</div>
-                              <div className="text-xs text-slate-600">{msg.from_email}</div>
-                            </div>
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-xs font-bold text-slate-600">From:</span>
+                            <span className="font-bold text-slate-900 text-sm">{msg.from_name}</span>
+                            <span className="text-xs text-slate-600">{msg.from_email}</span>
+                            {isOutgoing && (
+                              <span className="px-2 py-0.5 text-xs font-bold bg-emerald-200 text-emerald-800 rounded border border-emerald-300">
+                                You
+                              </span>
+                            )}
+                            {isLatest && !isOutgoing && (
+                              <span className="px-2 py-0.5 text-xs font-bold bg-amber-100 text-amber-700 rounded border border-amber-200">
+                                Latest
+                              </span>
+                            )}
                           </div>
 
                           {msg.to_emails && Array.isArray(msg.to_emails) && msg.to_emails.length > 0 && (
-                            <div className="flex items-start gap-2">
-                              <span className="text-xs font-bold text-slate-600 min-w-[35px]">To:</span>
-                              <div className="flex-1 text-xs text-slate-600">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className="text-xs font-bold text-slate-600">To:</span>
+                              <span className="text-xs text-slate-600">
                                 {(msg.to_emails as any[]).map((email: any, i: number) => (
                                   <span key={i}>
                                     {typeof email === 'string' ? email : email.emailAddress?.address || email.address || ''}
                                     {i < msg.to_emails.length - 1 && ', '}
                                   </span>
                                 ))}
-                              </div>
+                              </span>
                             </div>
                           )}
                         </div>
@@ -970,11 +1308,57 @@ ${message.body_content || message.body_preview}`
                         className="text-slate-700 text-sm prose max-w-none"
                         dangerouslySetInnerHTML={{ __html: msg.body_content || msg.body_preview }}
                       />
+
+                      {reservationId && messageAttachments.get(reservationId) && messageAttachments.get(reservationId)!.length > 0 && (
+                        <div className="mt-3 pt-3 border-t border-slate-200">
+                          <div className="flex items-center gap-2 mb-2">
+                            <Paperclip className="w-4 h-4 text-slate-500" />
+                            <span className="text-xs font-bold text-slate-600">
+                              Attachments ({messageAttachments.get(reservationId)!.length})
+                            </span>
+                          </div>
+                          <div className="space-y-1.5">
+                            {messageAttachments.get(reservationId)!.map((attachment) => (
+                              <div
+                                key={attachment.id}
+                                className="flex items-center gap-2 p-2 bg-white rounded border border-slate-200 hover:border-slate-300 transition-all"
+                              >
+                                {attachment.content_type.includes('pdf') ? (
+                                  <FileText className="w-4 h-4 text-red-500 flex-shrink-0" />
+                                ) : (
+                                  <File className="w-4 h-4 text-slate-500 flex-shrink-0" />
+                                )}
+                                <div className="flex-1 min-w-0">
+                                  <p className="text-xs font-semibold text-slate-900 truncate">
+                                    {attachment.display_name || attachment.filename}
+                                  </p>
+                                  <p className="text-xs text-slate-500">
+                                    {formatFileSize(attachment.file_size)}
+                                  </p>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
               );
             })}
+          </div>
+        )}
+
+        {/* Compose Reply Button - Below Messages */}
+        {!showCompose && messages.length > 0 && (
+          <div className="mt-4 mb-4">
+            <button
+              onClick={() => setShowCompose(true)}
+              className="w-full px-4 py-2.5 bg-sky-600 text-white rounded-lg hover:bg-sky-700 transition-all font-bold flex items-center justify-center gap-2 shadow-sm"
+            >
+              <Send className="w-4 h-4" />
+              Compose Reply
+            </button>
           </div>
         )}
 
@@ -1014,6 +1398,104 @@ ${message.body_content || message.body_preview}`
                     No active templates available. Please create templates in the Templates section.
                   </div>
                 )}
+              </div>
+
+              <div>
+                <label className="block text-sm font-semibold text-slate-700 mb-1.5">To Recipients</label>
+                <div className="space-y-2">
+                  <div className="flex gap-2">
+                    <input
+                      type="email"
+                      value={newToEmail}
+                      onChange={(e) => setNewToEmail(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          addToRecipient();
+                        }
+                      }}
+                      placeholder="Add recipient email..."
+                      className="flex-1 px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-sky-500 focus:border-sky-500 transition-all text-sm"
+                    />
+                    <button
+                      onClick={addToRecipient}
+                      disabled={!newToEmail.trim()}
+                      className="px-4 py-2 bg-sky-600 text-white rounded-lg hover:bg-sky-700 transition-all font-semibold text-sm disabled:bg-slate-300 disabled:cursor-not-allowed flex items-center gap-2"
+                    >
+                      <Plus className="w-4 h-4" />
+                      Add
+                    </button>
+                  </div>
+                  {toRecipients.length > 0 ? (
+                    <div className="flex flex-wrap gap-2">
+                      {toRecipients.map((email, index) => (
+                        <div
+                          key={index}
+                          className="flex items-center gap-2 px-3 py-1.5 bg-sky-50 border border-sky-200 rounded-lg"
+                        >
+                          <span className="text-sm text-slate-800 font-medium">{email}</span>
+                          <button
+                            onClick={() => removeToRecipient(email)}
+                            className="text-red-600 hover:text-red-800 transition-colors"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="text-center py-2 px-3 bg-amber-50 border border-amber-200 rounded-lg">
+                      <p className="text-xs text-amber-700 font-medium">No recipients added</p>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-semibold text-slate-700 mb-1.5">CC Recipients (Optional)</label>
+                <div className="space-y-2">
+                  <div className="flex gap-2">
+                    <input
+                      type="email"
+                      value={newCcEmail}
+                      onChange={(e) => setNewCcEmail(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          addCcRecipient();
+                        }
+                      }}
+                      placeholder="Add CC recipient email..."
+                      className="flex-1 px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-sky-500 focus:border-sky-500 transition-all text-sm"
+                    />
+                    <button
+                      onClick={addCcRecipient}
+                      disabled={!newCcEmail.trim()}
+                      className="px-4 py-2 bg-slate-600 text-white rounded-lg hover:bg-slate-700 transition-all font-semibold text-sm disabled:bg-slate-300 disabled:cursor-not-allowed flex items-center gap-2"
+                    >
+                      <Plus className="w-4 h-4" />
+                      Add
+                    </button>
+                  </div>
+                  {ccRecipients.length > 0 && (
+                    <div className="flex flex-wrap gap-2">
+                      {ccRecipients.map((email, index) => (
+                        <div
+                          key={index}
+                          className="flex items-center gap-2 px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg"
+                        >
+                          <span className="text-sm text-slate-800 font-medium">{email}</span>
+                          <button
+                            onClick={() => removeCcRecipient(email)}
+                            className="text-red-600 hover:text-red-800 transition-colors"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
 
               <div>
@@ -1077,6 +1559,77 @@ ${message.body_content || message.body_preview}`
                 )}
               </div>
 
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="block text-sm font-semibold text-slate-700">
+                    Attachments
+                  </label>
+                  <label
+                    className={`flex items-center gap-2 px-3 py-1.5 text-sm font-semibold rounded-lg transition-all cursor-pointer ${
+                      uploadingAttachment
+                        ? 'bg-slate-300 cursor-not-allowed'
+                        : 'bg-sky-600 text-white hover:bg-sky-700'
+                    }`}
+                  >
+                    {uploadingAttachment ? (
+                      <>
+                        <div className="animate-spin rounded-full h-3.5 w-3.5 border-b-2 border-white"></div>
+                        Uploading...
+                      </>
+                    ) : (
+                      <>
+                        <Upload className="w-3.5 h-3.5" />
+                        Add File
+                      </>
+                    )}
+                    <input
+                      type="file"
+                      onChange={handleAttachmentUpload}
+                      disabled={uploadingAttachment}
+                      className="hidden"
+                      accept="*/*"
+                    />
+                  </label>
+                </div>
+
+                {emailAttachments.length > 0 ? (
+                  <div className="space-y-2">
+                    {emailAttachments.map((attachment) => (
+                      <div
+                        key={attachment.id}
+                        className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg border border-slate-200"
+                      >
+                        {attachment.content_type.includes('pdf') ? (
+                          <FileText className="w-5 h-5 text-red-500 flex-shrink-0" />
+                        ) : (
+                          <File className="w-5 h-5 text-slate-500 flex-shrink-0" />
+                        )}
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-semibold text-slate-900 truncate">
+                            {attachment.display_name || attachment.filename}
+                          </p>
+                          <p className="text-xs text-slate-500">
+                            {formatFileSize(attachment.file_size)}
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => removeEmailAttachment(attachment.id)}
+                          className="p-2 text-red-600 hover:bg-red-50 rounded-lg transition-all"
+                          title="Remove attachment"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-center py-4 bg-slate-50 rounded-lg border border-slate-200">
+                    <Paperclip className="w-6 h-6 text-slate-400 mx-auto mb-1" />
+                    <p className="text-xs text-slate-500">No attachments</p>
+                  </div>
+                )}
+              </div>
+
               <div className="flex justify-end gap-3 pt-3 border-t border-slate-200">
                 {hasManualEdit && (
                   <button
@@ -1108,19 +1661,6 @@ ${message.body_content || message.body_preview}`
         )}
       </div>
 
-      {/* Fixed Bottom CTA - Only shown when not composing */}
-      {!showCompose && (
-        <div className="bg-white border-t border-slate-200 shadow-lg px-8 py-3">
-          <button
-            onClick={() => setShowCompose(true)}
-            className="w-full px-4 py-2.5 bg-sky-600 text-white rounded-lg hover:bg-sky-700 transition-all font-bold flex items-center justify-center gap-2 shadow-sm"
-          >
-            <Send className="w-4 h-4" />
-            Compose Reply
-          </button>
-        </div>
-      )}
-
       {/* Correction Modal */}
       {showCorrectionModal && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
@@ -1133,16 +1673,30 @@ ${message.body_content || message.body_preview}`
             <div className="flex-1 overflow-y-auto px-6 py-4">
               <div className="mb-4">
                 <label className="block text-xs font-semibold text-slate-600 mb-2">Original Text:</label>
-                <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm text-slate-700 whitespace-pre-wrap">
-                  {emailPreview}
-                </div>
+                {isHtmlTemplate ? (
+                  <div
+                    className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm text-slate-700 prose max-w-none"
+                    dangerouslySetInnerHTML={{ __html: emailPreview }}
+                  />
+                ) : (
+                  <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm text-slate-700 whitespace-pre-wrap">
+                    {emailPreview}
+                  </div>
+                )}
               </div>
 
               <div>
                 <label className="block text-xs font-semibold text-slate-600 mb-2">Corrected Text:</label>
-                <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3 text-sm text-slate-700 whitespace-pre-wrap">
-                  {correctedText}
-                </div>
+                {isHtmlTemplate ? (
+                  <div
+                    className="bg-emerald-50 border border-emerald-200 rounded-lg p-3 text-sm text-slate-700 prose max-w-none"
+                    dangerouslySetInnerHTML={{ __html: correctedText }}
+                  />
+                ) : (
+                  <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3 text-sm text-slate-700 whitespace-pre-wrap">
+                    {correctedText}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -1161,6 +1715,112 @@ ${message.body_content || message.body_preview}`
                 className="px-4 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 transition-all font-bold text-sm flex items-center gap-2"
               >
                 Accept Corrections
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Room Proposal Modal */}
+      {showProposalModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-lg shadow-xl max-w-4xl w-full max-h-[85vh] overflow-hidden flex flex-col">
+            <div className="px-6 py-4 border-b border-slate-200">
+              <h3 className="text-lg font-bold text-slate-900">
+                {editingProposal ? 'Edit Room Proposal' : 'Add Room Proposal'}
+              </h3>
+              <p className="text-sm text-slate-600 mt-1">Select rooms and set rates for this proposal</p>
+            </div>
+
+            <div className="flex-1 overflow-y-auto px-6 py-4">
+              <div className="mb-4">
+                <label className="block text-sm font-semibold text-slate-700 mb-1.5">Proposal Name</label>
+                <input
+                  type="text"
+                  value={proposalName}
+                  onChange={(e) => setProposalName(e.target.value)}
+                  placeholder={`Option ${roomProposals.length + 1}`}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-sky-500 focus:border-sky-500 transition-all text-sm"
+                />
+              </div>
+
+              <div className="mb-4">
+                <label className="block text-sm font-semibold text-slate-700 mb-2">Select Room Types</label>
+                <div className="flex flex-wrap gap-2">
+                  {roomTypes.map((roomType) => (
+                    <button
+                      key={roomType.code}
+                      onClick={() => toggleProposalRoom(roomType)}
+                      className={`px-3 py-1.5 border rounded-lg font-semibold text-sm transition-all ${
+                        proposalRooms.some(r => r.code === roomType.code)
+                          ? 'bg-sky-600 text-white border-sky-600 shadow-sm'
+                          : 'bg-white text-slate-700 border-slate-300 hover:border-sky-400 hover:text-sky-600'
+                      }`}
+                      title={roomType.name}
+                    >
+                      {roomType.code} - {roomType.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {proposalRooms.length > 0 && (
+                <div>
+                  <label className="block text-sm font-semibold text-slate-700 mb-2">Room Details</label>
+                  <div className="space-y-2">
+                    {proposalRooms.map((room) => (
+                      <div key={room.code} className="bg-slate-50 rounded-lg border border-slate-200 p-3 flex items-center gap-3">
+                        <div className="font-semibold text-slate-900 text-sm min-w-[80px]">
+                          {room.code}
+                        </div>
+                        <div className="flex-1 text-sm text-slate-700">
+                          {room.name}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <label className="text-xs text-slate-600 font-semibold">Qty:</label>
+                          <input
+                            type="number"
+                            min="1"
+                            value={room.quantity}
+                            onChange={(e) => updateProposalRoomQuantity(room.code, parseInt(e.target.value) || 1)}
+                            className="w-16 px-2 py-1.5 border border-slate-300 rounded text-sm"
+                          />
+                          <label className="text-xs text-slate-600 font-semibold ml-2">Rate:</label>
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            value={room.nightly_rate}
+                            onChange={(e) => updateProposalRoomRate(room.code, parseFloat(e.target.value) || 0)}
+                            className="w-24 px-2 py-1.5 border border-slate-300 rounded text-sm"
+                          />
+                          <span className="text-xs text-slate-600">ZAR/night</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="px-6 py-4 border-t border-slate-200 flex justify-end gap-3">
+              <button
+                onClick={() => {
+                  setShowProposalModal(false);
+                  setProposalName('');
+                  setProposalRooms([]);
+                  setEditingProposal(null);
+                }}
+                className="px-4 py-2 bg-slate-200 text-slate-700 rounded-lg hover:bg-slate-300 transition-all font-semibold text-sm"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={saveProposal}
+                disabled={proposalRooms.length === 0}
+                className="px-4 py-2 bg-sky-600 text-white rounded-lg hover:bg-sky-700 transition-all font-bold text-sm disabled:bg-slate-300 disabled:cursor-not-allowed"
+              >
+                {editingProposal ? 'Update Proposal' : 'Add Proposal'}
               </button>
             </div>
           </div>

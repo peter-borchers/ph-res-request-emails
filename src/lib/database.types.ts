@@ -224,6 +224,121 @@ export interface Database {
           created_at?: string;
         };
       };
+      room_proposals: {
+        Row: {
+          id: string;
+          reservation_id: string;
+          proposal_name: string;
+          rooms: Array<{
+            code: string;
+            name: string;
+            quantity: number;
+            nightly_rate: number;
+          }>;
+          display_order: number;
+          created_at: string;
+        };
+        Insert: {
+          id?: string;
+          reservation_id: string;
+          proposal_name?: string;
+          rooms?: any;
+          display_order?: number;
+          created_at?: string;
+        };
+        Update: {
+          id?: string;
+          reservation_id?: string;
+          proposal_name?: string;
+          rooms?: any;
+          display_order?: number;
+          created_at?: string;
+        };
+      };
+      template_attachments: {
+        Row: {
+          id: string;
+          filename: string;
+          display_name: string | null;
+          file_size: number;
+          content_type: string;
+          storage_path: string;
+          description: string | null;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          filename: string;
+          display_name?: string | null;
+          file_size: number;
+          content_type: string;
+          storage_path: string;
+          description?: string | null;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: {
+          id?: string;
+          filename?: string;
+          display_name?: string | null;
+          file_size?: number;
+          content_type?: string;
+          storage_path?: string;
+          description?: string | null;
+          created_at?: string;
+          updated_at?: string;
+        };
+      };
+      email_template_attachments: {
+        Row: {
+          id: string;
+          template_id: string;
+          attachment_id: string;
+          order_index: number;
+          created_at: string;
+        };
+        Insert: {
+          id?: string;
+          template_id: string;
+          attachment_id: string;
+          order_index?: number;
+          created_at?: string;
+        };
+        Update: {
+          id?: string;
+          template_id?: string;
+          attachment_id?: string;
+          order_index?: number;
+          created_at?: string;
+        };
+      };
+      message_attachments: {
+        Row: {
+          id: string;
+          reservation_id: string;
+          attachment_id: string;
+          message_type: string;
+          sent_at: string;
+          created_at: string;
+        };
+        Insert: {
+          id?: string;
+          reservation_id: string;
+          attachment_id: string;
+          message_type: string;
+          sent_at?: string;
+          created_at?: string;
+        };
+        Update: {
+          id?: string;
+          reservation_id?: string;
+          attachment_id?: string;
+          message_type?: string;
+          sent_at?: string;
+          created_at?: string;
+        };
+      };
     };
   };
 }

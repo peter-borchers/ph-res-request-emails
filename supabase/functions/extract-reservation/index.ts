@@ -22,7 +22,10 @@ interface ReservationData {
 }
 
 Deno.serve(async (req: Request) => {
+  console.log("extract-reservation function invoked", { method: req.method, url: req.url });
+
   if (req.method === "OPTIONS") {
+    console.log("Handling OPTIONS preflight request");
     return new Response(null, {
       status: 200,
       headers: corsHeaders,
@@ -30,14 +33,18 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
+    console.log("Creating Supabase client");
     const supabaseClient = createClient(
       Deno.env.get("SUPABASE_URL") ?? "",
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
     );
 
+    console.log("Parsing request body");
     const { emailContent }: ExtractRequest = await req.json();
+    console.log("Email content received, length:", emailContent?.length || 0);
 
     if (!emailContent) {
+      console.log("Error: Email content is missing");
       return new Response(
         JSON.stringify({ error: "Email content is required" }),
         {
@@ -50,6 +57,7 @@ Deno.serve(async (req: Request) => {
       );
     }
 
+    console.log("Fetching OpenAI API key from settings");
     const { data: settings } = await supabaseClient
       .from("settings")
       .select("openai_api_key")
@@ -58,6 +66,7 @@ Deno.serve(async (req: Request) => {
     const apiKey = settings?.openai_api_key;
 
     if (!apiKey) {
+      console.log("Error: OpenAI API key not configured");
       return new Response(
         JSON.stringify({
           error: "OpenAI API key not configured. Please add it in Admin Settings."
@@ -72,6 +81,7 @@ Deno.serve(async (req: Request) => {
       );
     }
 
+    console.log("Calling OpenAI API to extract reservation data");
     const openaiResponse = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -116,7 +126,7 @@ Deno.serve(async (req: Request) => {
 
     if (!openaiResponse.ok) {
       const errorText = await openaiResponse.text();
-      console.error("OpenAI API error:", errorText);
+      console.error("OpenAI API error:", { status: openaiResponse.status, error: errorText });
       return new Response(
         JSON.stringify({
           error: "Failed to extract data from OpenAI",
@@ -132,12 +142,15 @@ Deno.serve(async (req: Request) => {
       );
     }
 
+    console.log("OpenAI API call successful");
     const openaiData = await openaiResponse.json();
     const extractedText = (openaiData.choices[0]?.message?.content || "{}").trim();
+    console.log("Extracted text from OpenAI:", extractedText);
 
     let reservationData: ReservationData;
     try {
       reservationData = JSON.parse(extractedText);
+      console.log("Successfully parsed reservation data:", reservationData);
     } catch (parseError) {
       console.error("Failed to parse OpenAI response:", extractedText);
       return new Response(
@@ -155,6 +168,7 @@ Deno.serve(async (req: Request) => {
       );
     }
 
+    console.log("Returning successful response");
     return new Response(
       JSON.stringify({ data: reservationData }),
       {
