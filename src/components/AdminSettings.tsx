@@ -1,10 +1,16 @@
 import { MSGraphSync } from './MSGraphSync';
-import { Settings, Link as LinkIcon, Key, Save } from 'lucide-react';
+import { Settings, Link as LinkIcon, Key, Save, Mail } from 'lucide-react';
 import { useState, useEffect } from 'react';
 import { supabase } from '../lib/supabase';
 
 interface AdminSettingsProps {
   onSyncComplete?: () => void;
+}
+
+interface EmailTemplate {
+  id: string;
+  name: string;
+  subject: string;
 }
 
 export function AdminSettings({ onSyncComplete }: AdminSettingsProps = {}) {
@@ -13,19 +19,24 @@ export function AdminSettings({ onSyncComplete }: AdminSettingsProps = {}) {
   const [msgraphClientSecret, setMsgraphClientSecret] = useState('');
   const [msgraphTenantId, setMsgraphTenantId] = useState('');
   const [mailboxAddress, setMailboxAddress] = useState('');
+  const [missingDetailsTemplateId, setMissingDetailsTemplateId] = useState<string>('');
+  const [emailTemplates, setEmailTemplates] = useState<EmailTemplate[]>([]);
   const [saving, setSaving] = useState(false);
   const [savingMsgraph, setSavingMsgraph] = useState(false);
+  const [savingAutoDraft, setSavingAutoDraft] = useState(false);
   const [saveStatus, setSaveStatus] = useState<'idle' | 'success' | 'error'>('idle');
   const [msgraphSaveStatus, setMsgraphSaveStatus] = useState<'idle' | 'success' | 'error'>('idle');
+  const [autoDraftSaveStatus, setAutoDraftSaveStatus] = useState<'idle' | 'success' | 'error'>('idle');
 
   useEffect(() => {
     loadSettings();
+    loadEmailTemplates();
   }, []);
 
   async function loadSettings() {
     const { data } = await supabase
       .from('settings')
-      .select('openai_api_key, msgraph_client_id, msgraph_client_secret, msgraph_tenant_id, mailbox_address')
+      .select('openai_api_key, msgraph_client_id, msgraph_client_secret, msgraph_tenant_id, mailbox_address, missing_details_template_id')
       .maybeSingle();
 
     if (data) {
@@ -34,6 +45,23 @@ export function AdminSettings({ onSyncComplete }: AdminSettingsProps = {}) {
       if (data.msgraph_client_secret) setMsgraphClientSecret(data.msgraph_client_secret);
       if (data.msgraph_tenant_id) setMsgraphTenantId(data.msgraph_tenant_id);
       if (data.mailbox_address) setMailboxAddress(data.mailbox_address);
+      if (data.missing_details_template_id) setMissingDetailsTemplateId(data.missing_details_template_id);
+    }
+  }
+
+  async function loadEmailTemplates() {
+    const { data } = await supabase
+      .from('email_templates')
+      .select('id, name, subject_template')
+      .eq('is_active', true)
+      .order('name');
+
+    if (data) {
+      setEmailTemplates(data.map(t => ({
+        id: t.id,
+        name: t.name,
+        subject: t.subject_template
+      })));
     }
   }
 
@@ -115,6 +143,46 @@ export function AdminSettings({ onSyncComplete }: AdminSettingsProps = {}) {
       setMsgraphSaveStatus('error');
     } finally {
       setSavingMsgraph(false);
+    }
+  }
+
+  async function saveAutoDraftSettings() {
+    setSavingAutoDraft(true);
+    setAutoDraftSaveStatus('idle');
+
+    try {
+      const { data: existing } = await supabase
+        .from('settings')
+        .select('id')
+        .maybeSingle();
+
+      const updateData = {
+        missing_details_template_id: missingDetailsTemplateId || null,
+        updated_at: new Date().toISOString()
+      };
+
+      if (existing) {
+        const { error } = await supabase
+          .from('settings')
+          .update(updateData)
+          .eq('id', existing.id);
+
+        if (error) throw error;
+      } else {
+        const { error } = await supabase
+          .from('settings')
+          .insert(updateData);
+
+        if (error) throw error;
+      }
+
+      setAutoDraftSaveStatus('success');
+      setTimeout(() => setAutoDraftSaveStatus('idle'), 3000);
+    } catch (error) {
+      console.error('Failed to save auto-draft settings:', error);
+      setAutoDraftSaveStatus('error');
+    } finally {
+      setSavingAutoDraft(false);
     }
   }
 
@@ -304,6 +372,75 @@ export function AdminSettings({ onSyncComplete }: AdminSettingsProps = {}) {
 
             <div className="border-t border-slate-200 pt-5">
               <MSGraphSync mailboxAddress={mailboxAddress} onSyncComplete={onSyncComplete} />
+            </div>
+          </div>
+
+          <div className="bg-white border border-slate-200 rounded-lg p-6 shadow-sm">
+            <div className="flex items-start gap-3 mb-5">
+              <Mail className="w-6 h-6 text-amber-600 mt-1" />
+              <div className="flex-1">
+                <h2 className="text-xl font-bold text-slate-900 mb-1">Auto-Draft Configuration</h2>
+                <p className="text-sm text-slate-600 font-medium">
+                  Automatically create draft replies when reservation details are incomplete
+                </p>
+              </div>
+            </div>
+
+            <div className="border-t border-slate-200 pt-5 space-y-4">
+              <div>
+                <label htmlFor="missing-details-template" className="block text-sm font-semibold text-slate-700 mb-2">
+                  Template for Missing Details
+                </label>
+                <select
+                  id="missing-details-template"
+                  value={missingDetailsTemplateId}
+                  onChange={(e) => setMissingDetailsTemplateId(e.target.value)}
+                  className="w-full px-4 py-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-amber-500 transition-all"
+                >
+                  <option value="">No auto-draft (disabled)</option>
+                  {emailTemplates.map((template) => (
+                    <option key={template.id} value={template.id}>
+                      {template.name} - {template.subject}
+                    </option>
+                  ))}
+                </select>
+                <p className="mt-2 text-xs text-slate-500 font-medium">
+                  When a reservation email is received without complete dates or guest count,
+                  a draft reply will be automatically created using this template.
+                </p>
+              </div>
+
+              <div className="bg-amber-50 border border-amber-200 rounded-lg p-4">
+                <p className="text-xs text-amber-900 mb-2 font-bold">Available Placeholders:</p>
+                <ul className="text-xs text-amber-800 space-y-1 ml-4 list-disc font-medium">
+                  <li><code className="bg-amber-100 px-1 rounded">{'{{guest_name}}'}</code> - Guest's name</li>
+                  <li><code className="bg-amber-100 px-1 rounded">{'{{missing_fields_list}}'}</code> - List of missing details</li>
+                  <li><code className="bg-amber-100 px-1 rounded">{'{{check_in_date}}'}</code> - Check-in date (if provided)</li>
+                  <li><code className="bg-amber-100 px-1 rounded">{'{{check_out_date}}'}</code> - Check-out date (if provided)</li>
+                  <li><code className="bg-amber-100 px-1 rounded">{'{{guest_count}}'}</code> - Number of guests (if provided)</li>
+                </ul>
+              </div>
+
+              <button
+                onClick={saveAutoDraftSettings}
+                disabled={savingAutoDraft}
+                className="flex items-center gap-2 px-6 py-2.5 bg-amber-600 text-white rounded-lg hover:bg-amber-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-sm font-semibold"
+              >
+                <Save className="w-4 h-4" />
+                {savingAutoDraft ? 'Saving...' : 'Save Auto-Draft Settings'}
+              </button>
+
+              {autoDraftSaveStatus === 'success' && (
+                <div className="text-sm text-emerald-700 bg-emerald-50 px-4 py-3 rounded-lg border border-emerald-200 font-semibold">
+                  Auto-draft settings saved successfully
+                </div>
+              )}
+
+              {autoDraftSaveStatus === 'error' && (
+                <div className="text-sm text-red-700 bg-red-50 px-4 py-3 rounded-lg border border-red-200 font-semibold">
+                  Failed to save auto-draft settings. Please try again.
+                </div>
+              )}
             </div>
           </div>
 

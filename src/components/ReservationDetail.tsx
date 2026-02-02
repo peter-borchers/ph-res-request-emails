@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import type { Database } from '../lib/database.types';
-import { Calendar, Users, Send, Mail, MessageSquare, RefreshCw, ChevronDown, ChevronUp, History, ExternalLink, Code2, Eye, Plus, Trash2, Edit, File, FileText, Paperclip, Upload } from 'lucide-react';
+import { Calendar, Users, Send, Mail, MessageSquare, RefreshCw, ChevronDown, ChevronUp, History, ExternalLink, Code2, Eye, Plus, Trash2, Edit, File, FileText, Paperclip, Upload, Archive, ArchiveRestore } from 'lucide-react';
 import ReactQuill from 'react-quill';
 import 'react-quill/dist/quill.snow.css';
 
@@ -12,6 +12,7 @@ type EmailTemplate = Database['public']['Tables']['email_templates']['Row'];
 type RoomType = Database['public']['Tables']['room_types']['Row'];
 type RoomProposal = Database['public']['Tables']['room_proposals']['Row'];
 type TemplateAttachment = Database['public']['Tables']['template_attachments']['Row'];
+type EmailDraft = Database['public']['Tables']['email_drafts']['Row'];
 
 interface SelectedRoom {
   code: string;
@@ -35,6 +36,7 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
     room_types: [],
     nightly_rate_currency: 'ZAR',
     nightly_rate_amount: 0,
+    archived: false,
   });
   const [roomCount, setRoomCount] = useState<number>(1);
 
@@ -74,6 +76,9 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
   const [newToEmail, setNewToEmail] = useState<string>('');
   const [newCcEmail, setNewCcEmail] = useState<string>('');
   const [messageAttachments, setMessageAttachments] = useState<Map<string, TemplateAttachment[]>>(new Map());
+  const [emailDrafts, setEmailDrafts] = useState<EmailDraft[]>([]);
+  const [sendingDraft, setSendingDraft] = useState<string | null>(null);
+  const [sendingEmail, setSendingEmail] = useState(false);
 
   useEffect(() => {
     loadTemplates();
@@ -139,6 +144,7 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
   useEffect(() => {
     if (reservationId) {
       loadRoomProposals(reservationId);
+      loadEmailDrafts(reservationId);
     }
   }, [reservationId]);
 
@@ -516,6 +522,127 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
     }
   }
 
+  async function loadEmailDrafts(resId: string) {
+    const { data, error } = await supabase
+      .from('email_drafts')
+      .select('*')
+      .eq('reservation_id', resId)
+      .eq('status', 'pending')
+      .order('created_at', { ascending: false });
+
+    if (!error && data) {
+      setEmailDrafts(data);
+    }
+  }
+
+  async function sendDraft(draft: EmailDraft) {
+    if (!conversation || !reservationId) return;
+
+    setSendingDraft(draft.id);
+
+    try {
+      const apiUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/send-email`;
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          reservationId: draft.reservation_id,
+          conversationId: draft.conversation_id,
+          toRecipients: draft.to_recipients,
+          ccRecipients: draft.cc_recipients || [],
+          subject: draft.subject,
+          bodyHtml: draft.body_html || undefined,
+          bodyText: draft.body_text || undefined,
+          templateId: draft.template_id,
+          attachmentIds: [],
+        }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || 'Failed to send email');
+      }
+
+      await supabase
+        .from('email_drafts')
+        .delete()
+        .eq('id', draft.id);
+
+      await loadEmailDrafts(reservationId);
+      await refreshMessageHistory();
+
+      if (onReservationUpdate) {
+        onReservationUpdate();
+      }
+
+      alert('Email sent successfully!');
+    } catch (error) {
+      console.error('Error sending draft:', error);
+
+      await supabase
+        .from('email_drafts')
+        .update({
+          status: 'failed',
+          error_message: error instanceof Error ? error.message : 'Unknown error',
+          attempt_count: draft.attempt_count + 1,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', draft.id);
+
+      await loadEmailDrafts(reservationId);
+      alert('Failed to send email: ' + (error instanceof Error ? error.message : 'Unknown error'));
+    } finally {
+      setSendingDraft(null);
+    }
+  }
+
+  async function deleteDraft(draftId: string) {
+    if (!confirm('Are you sure you want to delete this draft?')) return;
+
+    await supabase
+      .from('email_drafts')
+      .delete()
+      .eq('id', draftId);
+
+    if (reservationId) {
+      await loadEmailDrafts(reservationId);
+    }
+  }
+
+  async function editDraft(draft: EmailDraft) {
+    if (draft.template_id) {
+      setSelectedTemplate(draft.template_id);
+    }
+
+    const recipients = Array.isArray(draft.to_recipients) ? draft.to_recipients : [];
+    setToRecipients(recipients);
+
+    const ccRecipientsArray = Array.isArray(draft.cc_recipients) ? draft.cc_recipients : [];
+    setCcRecipients(ccRecipientsArray);
+
+    if (draft.body_html) {
+      setEmailPreview(draft.body_html);
+      setIsHtmlTemplate(true);
+    } else if (draft.body_text) {
+      setEmailPreview(draft.body_text);
+      setIsHtmlTemplate(false);
+    }
+
+    setShowCompose(true);
+
+    await supabase
+      .from('email_drafts')
+      .delete()
+      .eq('id', draft.id);
+
+    if (reservationId) {
+      await loadEmailDrafts(reservationId);
+    }
+  }
+
   async function refreshMessageHistory() {
     if (!conversation || !mailboxAddress) return;
 
@@ -541,11 +668,39 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
 
       await new Promise(resolve => setTimeout(resolve, 500));
       await loadMessageHistory(conversation.id);
+      await loadReservationData(conversation.conversation_id);
+
+      if (onReservationUpdate) {
+        onReservationUpdate();
+      }
     } catch (error) {
       console.error('Error refreshing messages:', error);
       alert('Failed to refresh messages');
     } finally {
       setRefreshing(false);
+    }
+  }
+
+  async function toggleArchive() {
+    if (!reservationId) return;
+
+    const newArchivedState = !(reservation.archived ?? false);
+
+    const { error } = await supabase
+      .from('reservations')
+      .update({ archived: newArchivedState })
+      .eq('id', reservationId);
+
+    if (error) {
+      console.error('Error archiving reservation:', error);
+      alert('Failed to archive reservation');
+      return;
+    }
+
+    setReservation({ ...reservation, archived: newArchivedState });
+
+    if (onReservationUpdate) {
+      onReservationUpdate();
     }
   }
 
@@ -606,6 +761,8 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
         room_types: existingReservation.room_types || [],
         nightly_rate_currency: existingReservation.nightly_rate_currency,
         nightly_rate_amount: existingReservation.nightly_rate_amount,
+        additional_info: existingReservation.additional_info || '',
+        archived: existingReservation.archived ?? false,
       });
 
       if (existingReservation.room_details && existingReservation.room_details.length > 0) {
@@ -635,6 +792,7 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
         room_types: [],
         nightly_rate_currency: 'ZAR',
         nightly_rate_amount: 0,
+        archived: false,
       });
       setSelectedRooms([]);
     }
@@ -648,6 +806,7 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
     const reservationData = {
       conversation_id: conversation.conversation_id,
       guest_name: reservation.guest_name,
+      guest_email: reservation.guest_email,
       arrival_date: reservation.arrival_date,
       departure_date: reservation.departure_date,
       adults: reservation.adults || 0,
@@ -656,6 +815,7 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
       room_details: selectedRooms,
       nightly_rate_currency: reservation.nightly_rate_currency || 'ZAR',
       nightly_rate_amount: reservation.nightly_rate_amount || 0,
+      additional_info: reservation.additional_info || null,
       status: 'pending'
     };
 
@@ -705,7 +865,8 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
           emailContent: `From: ${message.from_name} <${message.from_email}>
 Subject: ${message.subject}
 
-${message.body_content || message.body_preview}`
+${message.body_content || message.body_preview}`,
+          reservationId: reservationId || undefined
         }),
       });
 
@@ -720,17 +881,65 @@ ${message.body_content || message.body_preview}`
       const result = await response.json();
       const extracted = result.data;
 
-      setReservation({
+      if (result.skipped) {
+        console.log('Extraction skipped:', result.reason);
+      }
+
+      const updatedReservation = {
+        ...reservation,
         guest_name: extracted.guest_name || message.from_name,
         guest_email: extracted.guest_email || message.from_email,
         arrival_date: extracted.arrival_date || '',
         departure_date: extracted.departure_date || '',
         adults: extracted.adult_count || 2,
         children: extracted.child_count || 0,
-        room_types: [],
-        nightly_rate_currency: 'ZAR',
-        nightly_rate_amount: 0,
-      });
+        additional_info: extracted.additional_info || reservation.additional_info || '',
+      };
+
+      setReservation(updatedReservation);
+
+      // Save extracted data to database immediately
+      if (conversation) {
+        const roomTypeCodes = selectedRooms.map(r => r.code);
+
+        const reservationData = {
+          conversation_id: conversation.conversation_id,
+          guest_name: updatedReservation.guest_name,
+          guest_email: updatedReservation.guest_email,
+          arrival_date: updatedReservation.arrival_date,
+          departure_date: updatedReservation.departure_date,
+          adults: updatedReservation.adults || 0,
+          children: updatedReservation.children || 0,
+          room_types: roomTypeCodes,
+          room_details: selectedRooms,
+          nightly_rate_currency: updatedReservation.nightly_rate_currency || 'ZAR',
+          nightly_rate_amount: updatedReservation.nightly_rate_amount || 0,
+          additional_info: updatedReservation.additional_info || null,
+          status: 'pending'
+        };
+
+        if (reservationId) {
+          await supabase
+            .from('reservations')
+            .update(reservationData)
+            .eq('id', reservationId);
+        } else {
+          const { data } = await supabase
+            .from('reservations')
+            .insert(reservationData)
+            .select()
+            .single();
+
+          if (data) {
+            setReservationId(data.id);
+          }
+        }
+
+        setHasUnsavedChanges(false);
+
+        // Refresh message history after save
+        await refreshMessageHistory();
+      }
     } catch (error) {
       console.error('Error extracting reservation data:', error);
       fallbackExtraction(message);
@@ -757,6 +966,7 @@ ${message.body_content || message.body_preview}`
       room_types: roomMatch ? [...new Set(roomMatch.map(r => r.toUpperCase()))] : [],
       nightly_rate_currency: 'ZAR',
       nightly_rate_amount: 0,
+      archived: false,
     });
   }
 
@@ -938,6 +1148,8 @@ ${message.body_content || message.body_preview}`
 
     const template = templates.find(t => t.id === selectedTemplate);
 
+    setSendingEmail(true);
+
     try {
       const apiUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/send-email`;
       const response = await fetch(apiUrl, {
@@ -973,6 +1185,8 @@ ${message.body_content || message.body_preview}`
     } catch (error) {
       console.error('Error sending email:', error);
       alert('Failed to send email');
+    } finally {
+      setSendingEmail(false);
     }
   }
 
@@ -1002,14 +1216,38 @@ ${message.body_content || message.body_preview}`
         <div className="px-8 py-3">
           <div className="flex justify-between items-center mb-3">
             <h2 className="text-xl font-bold text-slate-900">{conversation.subject}</h2>
-            <button
-              onClick={refreshMessageHistory}
-              disabled={refreshing}
-              className="px-4 py-1.5 bg-white text-slate-700 rounded-lg hover:bg-slate-100 transition-all flex items-center gap-2 font-medium border border-slate-200 shadow-sm disabled:opacity-50 text-sm"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
-              {refreshing ? 'Refreshing...' : 'Refresh'}
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={refreshMessageHistory}
+                disabled={refreshing}
+                className="px-4 py-1.5 bg-white text-slate-700 rounded-lg hover:bg-slate-100 transition-all flex items-center gap-2 font-medium border border-slate-200 shadow-sm disabled:opacity-50 text-sm"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+                {refreshing ? 'Refreshing...' : 'Refresh'}
+              </button>
+              {reservationId && (
+                <button
+                  onClick={toggleArchive}
+                  className={`px-4 py-1.5 rounded-lg transition-all flex items-center gap-2 font-medium shadow-sm text-sm ${
+                    reservation.archived
+                      ? 'bg-emerald-600 text-white hover:bg-emerald-700'
+                      : 'bg-slate-600 text-white hover:bg-slate-700'
+                  }`}
+                >
+                  {reservation.archived ? (
+                    <>
+                      <ArchiveRestore className="w-3.5 h-3.5" />
+                      Unarchive
+                    </>
+                  ) : (
+                    <>
+                      <Archive className="w-3.5 h-3.5" />
+                      Archive
+                    </>
+                  )}
+                </button>
+              )}
+            </div>
           </div>
 
           {extracting && (
@@ -1208,7 +1446,7 @@ ${message.body_content || message.body_preview}`
         <h3 className="text-base font-bold text-slate-900 mb-3 flex items-center gap-2">
           <MessageSquare className="w-4 h-4 text-sky-600" />
           Conversation History
-          <span className="text-sm text-slate-500 font-medium">({messages.length})</span>
+          <span className="text-sm text-slate-500 font-medium">({messages.length + emailDrafts.length})</span>
         </h3>
 
         {messages.length === 0 ? (
@@ -1222,128 +1460,207 @@ ${message.body_content || message.body_preview}`
             {messages.map((msg, idx) => {
               const mailboxDomain = mailboxAddress ? mailboxAddress.split('@')[1] : '';
               const isOutgoing = mailboxDomain && msg.from_email ? msg.from_email.includes(`@${mailboxDomain}`) : false;
-              const isExpanded = expandedMessageId === msg.id;
               const isLatest = idx === messages.length - 1;
+              const hasDraft = isLatest && emailDrafts.length > 0;
+              const isExpanded = hasDraft ? false : expandedMessageId === msg.id;
 
               return (
-                <div
-                  key={msg.id}
-                  className={`rounded-lg border shadow-sm transition-all ${
-                    isOutgoing
-                      ? 'bg-emerald-50 border-emerald-200'
-                      : 'bg-sky-50 border-sky-200'
-                  }`}
-                >
-                  <button
-                    onClick={() => setExpandedMessageId(isExpanded ? null : msg.id)}
-                    className="w-full p-3 text-left hover:bg-opacity-80 transition-all"
+                <React.Fragment key={msg.id}>
+                  <div
+                    className={`rounded-lg border shadow-sm transition-all ${
+                      isOutgoing
+                        ? 'bg-emerald-50 border-emerald-200'
+                        : 'bg-sky-50 border-sky-200'
+                    }`}
                   >
-                    <div className="flex justify-between items-start gap-4">
-                      <div className="flex-1">
-                        <div className="space-y-1 mb-2">
-                          <div className="flex items-center gap-2 flex-wrap">
-                            <span className="text-xs font-bold text-slate-600">From:</span>
-                            <span className="font-bold text-slate-900 text-sm">{msg.from_name}</span>
-                            <span className="text-xs text-slate-600">{msg.from_email}</span>
-                            {isOutgoing && (
-                              <span className="px-2 py-0.5 text-xs font-bold bg-emerald-200 text-emerald-800 rounded border border-emerald-300">
-                                You
-                              </span>
-                            )}
-                            {isLatest && !isOutgoing && (
-                              <span className="px-2 py-0.5 text-xs font-bold bg-amber-100 text-amber-700 rounded border border-amber-200">
-                                Latest
-                              </span>
+                    <button
+                      onClick={() => setExpandedMessageId(isExpanded ? null : msg.id)}
+                      className="w-full p-3 text-left hover:bg-opacity-80 transition-all"
+                    >
+                      <div className="flex justify-between items-start gap-4">
+                        <div className="flex-1">
+                          <div className="space-y-1 mb-2">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className="text-xs font-bold text-slate-600">From:</span>
+                              <span className="font-bold text-slate-900 text-sm">{msg.from_name}</span>
+                              <span className="text-xs text-slate-600">{msg.from_email}</span>
+                              {isOutgoing && (
+                                <span className="px-2 py-0.5 text-xs font-bold bg-emerald-200 text-emerald-800 rounded border border-emerald-300">
+                                  You
+                                </span>
+                              )}
+                              {isLatest && !isOutgoing && (
+                                <span className="px-2 py-0.5 text-xs font-bold bg-amber-100 text-amber-700 rounded border border-amber-200">
+                                  Latest
+                                </span>
+                              )}
+                            </div>
+
+                            {msg.to_emails && Array.isArray(msg.to_emails) && msg.to_emails.length > 0 && (
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="text-xs font-bold text-slate-600">To:</span>
+                                <span className="text-xs text-slate-600">
+                                  {(msg.to_emails as any[]).map((email: any, i: number) => (
+                                    <span key={i}>
+                                      {typeof email === 'string' ? email : email.emailAddress?.address || email.address || ''}
+                                      {i < msg.to_emails.length - 1 && ', '}
+                                    </span>
+                                  ))}
+                                </span>
+                              </div>
                             )}
                           </div>
 
-                          {msg.to_emails && Array.isArray(msg.to_emails) && msg.to_emails.length > 0 && (
-                            <div className="flex items-center gap-2 flex-wrap">
-                              <span className="text-xs font-bold text-slate-600">To:</span>
-                              <span className="text-xs text-slate-600">
-                                {(msg.to_emails as any[]).map((email: any, i: number) => (
-                                  <span key={i}>
-                                    {typeof email === 'string' ? email : email.emailAddress?.address || email.address || ''}
-                                    {i < msg.to_emails.length - 1 && ', '}
-                                  </span>
-                                ))}
-                              </span>
+                          {!isExpanded && (
+                            <div className="text-sm text-slate-600 mt-2 line-clamp-2">
+                              {msg.body_preview}
                             </div>
                           )}
                         </div>
+                        <div className="flex flex-col items-end gap-2 flex-shrink-0">
+                          <span className="text-xs text-slate-500 font-medium whitespace-nowrap">
+                            {new Date(msg.received_at).toLocaleString('en-GB', {
+                              day: '2-digit',
+                              month: 'short',
+                              year: 'numeric',
+                              hour: '2-digit',
+                              minute: '2-digit'
+                            })}
+                          </span>
+                          {isExpanded ? (
+                            <ChevronUp className="w-5 h-5 text-slate-400" />
+                          ) : (
+                            <ChevronDown className="w-5 h-5 text-slate-400" />
+                          )}
+                        </div>
+                      </div>
+                    </button>
 
-                        {!isExpanded && (
-                          <div className="text-sm text-slate-600 mt-2 line-clamp-2">
-                            {msg.body_preview}
+                    {isExpanded && (
+                      <div className="px-3 pb-3 border-t border-slate-300">
+                        {msg.subject && (
+                          <div className="text-sm font-bold text-slate-700 mb-2 mt-2">
+                            Subject: {msg.subject}
+                          </div>
+                        )}
+                        <div
+                          className="text-slate-700 text-sm prose max-w-none"
+                          dangerouslySetInnerHTML={{ __html: msg.body_content || msg.body_preview }}
+                        />
+
+                        {reservationId && messageAttachments.get(reservationId) && messageAttachments.get(reservationId)!.length > 0 && (
+                          <div className="mt-3 pt-3 border-t border-slate-200">
+                            <div className="flex items-center gap-2 mb-2">
+                              <Paperclip className="w-4 h-4 text-slate-500" />
+                              <span className="text-xs font-bold text-slate-600">
+                                Attachments ({messageAttachments.get(reservationId)!.length})
+                              </span>
+                            </div>
+                            <div className="space-y-1.5">
+                              {messageAttachments.get(reservationId)!.map((attachment) => (
+                                <div
+                                  key={attachment.id}
+                                  className="flex items-center gap-2 p-2 bg-white rounded border border-slate-200 hover:border-slate-300 transition-all"
+                                >
+                                  {attachment.content_type.includes('pdf') ? (
+                                    <FileText className="w-4 h-4 text-red-500 flex-shrink-0" />
+                                  ) : (
+                                    <File className="w-4 h-4 text-slate-500 flex-shrink-0" />
+                                  )}
+                                  <div className="flex-1 min-w-0">
+                                    <p className="text-xs font-semibold text-slate-900 truncate">
+                                      {attachment.display_name || attachment.filename}
+                                    </p>
+                                    <p className="text-xs text-slate-500">
+                                      {formatFileSize(attachment.file_size)}
+                                    </p>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
                           </div>
                         )}
                       </div>
-                      <div className="flex flex-col items-end gap-2 flex-shrink-0">
-                        <span className="text-xs text-slate-500 font-medium whitespace-nowrap">
-                          {new Date(msg.received_at).toLocaleString('en-GB', {
-                            day: '2-digit',
-                            month: 'short',
-                            year: 'numeric',
-                            hour: '2-digit',
-                            minute: '2-digit'
-                          })}
-                        </span>
-                        {isExpanded ? (
-                          <ChevronUp className="w-5 h-5 text-slate-400" />
-                        ) : (
-                          <ChevronDown className="w-5 h-5 text-slate-400" />
-                        )}
-                      </div>
-                    </div>
-                  </button>
+                    )}
+                  </div>
 
-                  {isExpanded && (
-                    <div className="px-3 pb-3 border-t border-slate-300">
-                      {msg.subject && (
-                        <div className="text-sm font-bold text-slate-700 mb-2 mt-2">
-                          Subject: {msg.subject}
-                        </div>
-                      )}
-                      <div
-                        className="text-slate-700 text-sm prose max-w-none"
-                        dangerouslySetInnerHTML={{ __html: msg.body_content || msg.body_preview }}
-                      />
-
-                      {reservationId && messageAttachments.get(reservationId) && messageAttachments.get(reservationId)!.length > 0 && (
-                        <div className="mt-3 pt-3 border-t border-slate-200">
-                          <div className="flex items-center gap-2 mb-2">
-                            <Paperclip className="w-4 h-4 text-slate-500" />
-                            <span className="text-xs font-bold text-slate-600">
-                              Attachments ({messageAttachments.get(reservationId)!.length})
+                  {/* Show drafts after the latest message */}
+                  {isLatest && emailDrafts.map((draft) => (
+                    <div
+                      key={draft.id}
+                      className="rounded-lg border shadow-sm p-4 bg-amber-50 border-amber-300"
+                    >
+                      <div className="flex items-start justify-between mb-2">
+                        <div className="flex-1">
+                          <div className="flex items-center gap-2 mb-1">
+                            <span className="px-2 py-0.5 text-xs font-bold rounded bg-amber-200 text-amber-800 border border-amber-300">
+                              DRAFT
+                            </span>
+                            <span className="text-xs text-slate-600">
+                              Created {new Date(draft.created_at).toLocaleDateString('en-GB', {
+                                day: '2-digit',
+                                month: 'short',
+                                year: 'numeric',
+                                hour: '2-digit',
+                                minute: '2-digit'
+                              })}
                             </span>
                           </div>
-                          <div className="space-y-1.5">
-                            {messageAttachments.get(reservationId)!.map((attachment) => (
-                              <div
-                                key={attachment.id}
-                                className="flex items-center gap-2 p-2 bg-white rounded border border-slate-200 hover:border-slate-300 transition-all"
-                              >
-                                {attachment.content_type.includes('pdf') ? (
-                                  <FileText className="w-4 h-4 text-red-500 flex-shrink-0" />
-                                ) : (
-                                  <File className="w-4 h-4 text-slate-500 flex-shrink-0" />
-                                )}
-                                <div className="flex-1 min-w-0">
-                                  <p className="text-xs font-semibold text-slate-900 truncate">
-                                    {attachment.display_name || attachment.filename}
-                                  </p>
-                                  <p className="text-xs text-slate-500">
-                                    {formatFileSize(attachment.file_size)}
-                                  </p>
-                                </div>
-                              </div>
-                            ))}
+                          <div className="text-sm font-semibold text-slate-900 mb-1">{draft.subject}</div>
+                          <div className="text-xs text-slate-600 mb-1">
+                            To: {Array.isArray(draft.to_recipients) ? draft.to_recipients.join(', ') : 'No recipients'}
                           </div>
                         </div>
-                      )}
+                      </div>
+
+                      <div className="text-xs text-slate-700 mb-3 p-2 bg-white rounded border border-slate-200 max-h-48 overflow-y-auto">
+                        {draft.body_text ? (
+                          <div className="whitespace-pre-wrap">{draft.body_text}</div>
+                        ) : draft.body_html ? (
+                          <div dangerouslySetInnerHTML={{ __html: draft.body_html }} />
+                        ) : (
+                          <span className="text-slate-400 italic">No content</span>
+                        )}
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => sendDraft(draft)}
+                          disabled={sendingDraft === draft.id}
+                          className="px-3 py-1.5 bg-sky-600 text-white rounded-lg hover:bg-sky-700 transition-all font-semibold flex items-center gap-1.5 disabled:bg-slate-300 disabled:cursor-not-allowed shadow-sm text-xs"
+                        >
+                          {sendingDraft === draft.id ? (
+                            <>
+                              <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-white"></div>
+                              Sending...
+                            </>
+                          ) : (
+                            <>
+                              <Send className="w-3 h-3" />
+                              Send Now
+                            </>
+                          )}
+                        </button>
+                        <button
+                          onClick={() => editDraft(draft)}
+                          disabled={sendingDraft === draft.id}
+                          className="px-3 py-1.5 bg-white text-slate-700 rounded-lg hover:bg-slate-100 transition-all font-semibold flex items-center gap-1.5 border border-slate-300 disabled:opacity-50 disabled:cursor-not-allowed shadow-sm text-xs"
+                        >
+                          <Edit className="w-3 h-3" />
+                          Edit
+                        </button>
+                        <button
+                          onClick={() => deleteDraft(draft.id)}
+                          disabled={sendingDraft === draft.id}
+                          className="px-3 py-1.5 bg-white text-red-600 rounded-lg hover:bg-red-50 transition-all font-semibold flex items-center gap-1.5 border border-red-300 disabled:opacity-50 disabled:cursor-not-allowed shadow-sm text-xs"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                          Delete
+                        </button>
+                      </div>
                     </div>
-                  )}
-                </div>
+                  ))}
+                </React.Fragment>
               );
             })}
           </div>
@@ -1649,11 +1966,20 @@ ${message.body_content || message.body_preview}`
                 )}
                 <button
                   onClick={handleSendEmail}
-                  disabled={hasManualEdit || !selectedTemplate || !emailPreview || emailPreview.includes('Please select')}
+                  disabled={sendingEmail || hasManualEdit || !selectedTemplate || !emailPreview || emailPreview.includes('Please select')}
                   className="px-6 py-2 bg-sky-600 text-white rounded-lg hover:bg-sky-700 transition-all font-bold flex items-center gap-2 disabled:bg-slate-300 disabled:cursor-not-allowed shadow-sm text-sm"
                 >
-                  <Send className="w-4 h-4" />
-                  Send Reply
+                  {sendingEmail ? (
+                    <>
+                      <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+                      Sending...
+                    </>
+                  ) : (
+                    <>
+                      <Send className="w-4 h-4" />
+                      Send Reply
+                    </>
+                  )}
                 </button>
               </div>
             </div>

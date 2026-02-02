@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import type { Database } from '../lib/database.types';
-import { Mail, Calendar, Users, Bed, ArrowDownLeft, ArrowUpRight, Sparkles, RefreshCw } from 'lucide-react';
+import { Mail, Calendar, Users, Bed, ArrowDownLeft, ArrowUpRight, Sparkles, RefreshCw, Archive } from 'lucide-react';
 
 type Conversation = Database['public']['Tables']['msgraph_conversations']['Row'];
 type Reservation = Database['public']['Tables']['reservations']['Row'];
 type RoomProposal = Database['public']['Tables']['room_proposals']['Row'];
+
+type ViewMode = 'active' | 'archived';
 
 interface ConversationWithDetails extends Conversation {
   reservation?: Reservation;
@@ -27,6 +29,7 @@ export function EmailInbox({ selectedEmailId, onSelectEmail, refreshTrigger }: E
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [mailboxDomain, setMailboxDomain] = useState<string>('');
+  const [viewMode, setViewMode] = useState<ViewMode>('active');
 
   useEffect(() => {
     loadMailboxSettings();
@@ -200,13 +203,18 @@ export function EmailInbox({ selectedEmailId, onSelectEmail, refreshTrigger }: E
     return !conversation.viewed_at;
   }
 
+  const filteredConversations = conversations.filter(conversation => {
+    const isArchived = conversation.reservation?.archived ?? false;
+    return viewMode === 'archived' ? isArchived : !isArchived;
+  });
+
   return (
     <div className="w-96 border-r border-slate-200 bg-white flex flex-col h-screen">
       <div className="p-5 border-b border-slate-200 bg-slate-50">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between mb-3">
           <div>
             <h2 className="text-lg font-bold text-slate-900">Enquiries</h2>
-            <p className="text-sm text-slate-500 mt-0.5">{conversations.length} conversation{conversations.length !== 1 ? 's' : ''}</p>
+            <p className="text-sm text-slate-500 mt-0.5">{filteredConversations.length} conversation{filteredConversations.length !== 1 ? 's' : ''}</p>
           </div>
           <button
             onClick={handleRefresh}
@@ -217,10 +225,34 @@ export function EmailInbox({ selectedEmailId, onSelectEmail, refreshTrigger }: E
             <RefreshCw className={`w-5 h-5 text-slate-600 ${refreshing ? 'animate-spin' : ''}`} />
           </button>
         </div>
+
+        <div className="flex gap-2">
+          <button
+            onClick={() => setViewMode('active')}
+            className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-all ${
+              viewMode === 'active'
+                ? 'bg-sky-600 text-white shadow-sm'
+                : 'bg-white text-slate-600 hover:bg-slate-100 border border-slate-200'
+            }`}
+          >
+            Active
+          </button>
+          <button
+            onClick={() => setViewMode('archived')}
+            className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-1.5 ${
+              viewMode === 'archived'
+                ? 'bg-sky-600 text-white shadow-sm'
+                : 'bg-white text-slate-600 hover:bg-slate-100 border border-slate-200'
+            }`}
+          >
+            <Archive className="w-4 h-4" />
+            Archived
+          </button>
+        </div>
       </div>
 
       <div className="flex-1 overflow-y-auto">
-        {conversations.map((conversation) => {
+        {filteredConversations.map((conversation) => {
           const reservation = conversation.reservation;
           const nights = reservation
             ? calculateNights(reservation.arrival_date, reservation.departure_date)

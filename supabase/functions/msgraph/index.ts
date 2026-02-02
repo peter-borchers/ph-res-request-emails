@@ -382,11 +382,25 @@ async function handleOAuthCallback(req: Request, supabase: any) {
   );
 }
 
-async function autoExtractReservation(supabase: any, conversationUuid: string, conversationId: string, firstMessage: any) {
+function replacePlaceholders(template: string, data: Record<string, any>): string {
+  return template.replace(/\{\{(\w+)\}\}/g, (match, key) => {
+    if (key === 'missing_details') {
+      const missing = [];
+      if (!data.arrival_date) missing.push('Check-in date');
+      if (!data.departure_date) missing.push('Check-out date');
+      if (!data.guest_name) missing.push('Guest name');
+      if (!data.guest_email) missing.push('Contact email');
+      return missing.length > 0 ? missing.map(item => `- ${item}`).join('\n') : 'N/A';
+    }
+    return data[key] !== undefined && data[key] !== null ? String(data[key]) : '';
+  });
+}
+
+async function autoExtractReservation(supabase: any, conversationUuid: string, conversationId: string, allMessages: any[]) {
   try {
     const { data: settings } = await supabase
       .from("settings")
-      .select("openai_api_key")
+      .select("openai_api_key, missing_details_template_id")
       .maybeSingle();
 
     if (!settings?.openai_api_key) {
@@ -398,11 +412,16 @@ async function autoExtractReservation(supabase: any, conversationUuid: string, c
       return;
     }
 
-    const emailContent = `
-Subject: ${firstMessage.subject || ""}
-From: ${firstMessage.from?.emailAddress?.name || ""} <${firstMessage.from?.emailAddress?.address || ""}>
-Body: ${firstMessage.bodyPreview || firstMessage.body?.content || ""}
-    `.trim();
+    const firstMessage = allMessages[0];
+
+    const emailContent = allMessages.map((msg, idx) => `
+Message ${idx + 1}:
+Subject: ${msg.subject || ""}
+From: ${msg.from?.emailAddress?.name || ""} <${msg.from?.emailAddress?.address || ""}>
+Date: ${msg.receivedDateTime || msg.sentDateTime || ""}
+Body: ${msg.bodyPreview || msg.body?.content || ""}
+---
+    `.trim()).join('\n\n');
 
     const extractResponse = await fetch(`${Deno.env.get("SUPABASE_URL")}/functions/v1/extract-reservation`, {
       method: "POST",
@@ -435,32 +454,200 @@ Body: ${firstMessage.bodyPreview || firstMessage.body?.content || ""}
 
     const { data: existingReservation } = await supabase
       .from("reservations")
-      .select("id")
+      .select("id, arrival_date, departure_date, guest_name, guest_email")
       .eq("conversation_id", conversationId)
       .maybeSingle();
 
+    const guestEmail = reservationData.guest_email || firstMessage.from?.emailAddress?.address || "";
+
+    let targetReservation;
+
     if (existingReservation) {
-      await supabase
-        .from("msgraph_conversations")
-        .update({ auto_extracted: true })
-        .eq("id", conversationUuid);
-      return;
+      const needsUpdate = !existingReservation.arrival_date ||
+                         !existingReservation.departure_date ||
+                         !existingReservation.guest_name ||
+                         !existingReservation.guest_email;
+
+      if (!needsUpdate) {
+        console.log(`Reservation for ${conversationId} is already complete, skipping`);
+        await supabase
+          .from("msgraph_conversations")
+          .update({ auto_extracted: true })
+          .eq("id", conversationUuid);
+        return;
+      }
+
+      console.log(`Updating incomplete reservation ${existingReservation.id} with new data`);
+
+      const updateData: any = {};
+      if (reservationData.arrival_date && !existingReservation.arrival_date) {
+        updateData.arrival_date = reservationData.arrival_date;
+      }
+      if (reservationData.departure_date && !existingReservation.departure_date) {
+        updateData.departure_date = reservationData.departure_date;
+      }
+      if (reservationData.guest_name && !existingReservation.guest_name) {
+        updateData.guest_name = reservationData.guest_name;
+      }
+      if (guestEmail && !existingReservation.guest_email) {
+        updateData.guest_email = guestEmail;
+      }
+      if (reservationData.adult_count) {
+        updateData.adults = reservationData.adult_count;
+      }
+      if (reservationData.child_count) {
+        updateData.children = reservationData.child_count;
+      }
+      if (reservationData.additional_info) {
+        updateData.additional_info = reservationData.additional_info;
+      }
+
+      const { data: updatedReservation, error: updateError } = await supabase
+        .from("reservations")
+        .update(updateData)
+        .eq("id", existingReservation.id)
+        .select()
+        .single();
+
+      if (updateError) {
+        console.error("Failed to update reservation:", updateError);
+        return;
+      }
+
+      targetReservation = updatedReservation;
+    } else {
+      const { data: newReservation, error: insertError } = await supabase
+        .from("reservations")
+        .insert({
+          conversation_id: conversationId,
+          guest_name: reservationData.guest_name || "",
+          guest_email: guestEmail,
+          arrival_date: reservationData.arrival_date || null,
+          departure_date: reservationData.departure_date || null,
+          adults: reservationData.adult_count || 0,
+          children: reservationData.child_count || 0,
+          room_types: [],
+          nightly_rate_currency: "ZAR",
+          nightly_rate_amount: 0,
+          additional_info: reservationData.additional_info || null,
+          status: "pending",
+        })
+        .select()
+        .single();
+
+      if (insertError) {
+        console.error("Failed to insert reservation:", insertError);
+        await supabase
+          .from("msgraph_conversations")
+          .update({ auto_extracted: true })
+          .eq("id", conversationUuid);
+        return;
+      }
+
+      targetReservation = newReservation;
     }
 
-    await supabase
-      .from("reservations")
-      .insert({
-        conversation_id: conversationId,
-        guest_name: reservationData.guest_name || "",
-        arrival_date: reservationData.arrival_date || null,
-        departure_date: reservationData.departure_date || null,
-        adults: reservationData.adult_count || 0,
-        children: reservationData.child_count || 0,
-        room_types: [],
-        nightly_rate_currency: "ZAR",
-        nightly_rate_amount: 0,
-        status: "pending",
-      });
+    // Check if reservation data is incomplete
+    const isIncomplete = !targetReservation.arrival_date ||
+                        !targetReservation.departure_date ||
+                        !targetReservation.guest_name ||
+                        !targetReservation.guest_email;
+
+    if (isIncomplete && targetReservation) {
+      console.log(`Reservation data incomplete for ${conversationId}, checking for existing draft...`);
+
+      const { data: existingDraft } = await supabase
+        .from("email_drafts")
+        .select("id")
+        .eq("reservation_id", targetReservation.id)
+        .eq("status", "pending")
+        .maybeSingle();
+
+      if (existingDraft) {
+        console.log(`Draft already exists for reservation ${targetReservation.id}, skipping creation`);
+      } else {
+        let templateId = null;
+        let subject: string;
+        let bodyText: string;
+        let bodyHtml: string | null = null;
+
+        // Prepare data for placeholder replacement
+        const templateData = {
+          guest_name: targetReservation.guest_name || guestEmail.split('@')[0] || 'Guest',
+          guest_email: targetReservation.guest_email || guestEmail,
+          arrival_date: targetReservation.arrival_date || 'Not provided',
+          departure_date: targetReservation.departure_date || 'Not provided',
+          adults: targetReservation.adults || 0,
+          children: targetReservation.children || 0,
+          missing_details: true,
+        };
+
+        // Try to use the missing_details_template_id from settings
+        if (settings?.missing_details_template_id) {
+          const { data: template } = await supabase
+            .from("email_templates")
+            .select("id, subject_template, body_template, html_body_template")
+            .eq("id", settings.missing_details_template_id)
+            .eq("is_active", true)
+            .maybeSingle();
+
+          if (template) {
+            templateId = template.id;
+            subject = replacePlaceholders(template.subject_template, templateData);
+
+            if (template.html_body_template) {
+              bodyHtml = replacePlaceholders(template.html_body_template, templateData);
+              bodyText = '';
+            } else {
+              bodyText = replacePlaceholders(template.body_template, templateData);
+            }
+
+            console.log(`Using template ${templateId} for missing details draft`);
+          } else {
+            console.log(`Template ${settings.missing_details_template_id} not found or inactive, using default message`);
+            subject = `Re: ${firstMessage.subject || "Reservation Inquiry"}`;
+            bodyText = `Thank you for your inquiry. To assist you better, we need some additional information:\n\n${
+              !targetReservation.arrival_date ? "- Check-in date\n" : ""
+            }${
+              !targetReservation.departure_date ? "- Check-out date\n" : ""
+            }${
+              !targetReservation.guest_name ? "- Guest name\n" : ""
+            }${
+              !targetReservation.guest_email ? "- Contact email\n" : ""
+            }\nPlease provide these details so we can prepare your personalized offer.`;
+          }
+        } else {
+          console.log(`No missing_details_template_id configured, using default message`);
+          subject = `Re: ${firstMessage.subject || "Reservation Inquiry"}`;
+          bodyText = `Thank you for your inquiry. To assist you better, we need some additional information:\n\n${
+            !targetReservation.arrival_date ? "- Check-in date\n" : ""
+          }${
+            !targetReservation.departure_date ? "- Check-out date\n" : ""
+          }${
+            !targetReservation.guest_name ? "- Guest name\n" : ""
+          }${
+            !targetReservation.guest_email ? "- Contact email\n" : ""
+          }\nPlease provide these details so we can prepare your personalized offer.`;
+        }
+
+        await supabase
+          .from("email_drafts")
+          .insert({
+            reservation_id: targetReservation.id,
+            conversation_id: conversationId,
+            template_id: templateId,
+            to_recipients: [targetReservation.guest_email || guestEmail].filter(Boolean),
+            cc_recipients: [],
+            subject: subject,
+            body_text: bodyText,
+            body_html: bodyHtml,
+            status: "pending",
+            attempt_count: 0,
+          });
+
+        console.log(`Draft created for incomplete reservation ${targetReservation.id}`);
+      }
+    }
 
     await supabase
       .from("msgraph_conversations")
@@ -686,7 +873,7 @@ async function handleSync(req: Request, supabase: any) {
           newConversations.push({
             conversationId: convId,
             conversationUuid: convResult.data.id,
-            firstMessage: firstMsg
+            allMessages: messages
           });
         }
       }
@@ -694,7 +881,7 @@ async function handleSync(req: Request, supabase: any) {
 
     for (const conv of newConversations) {
       try {
-        await autoExtractReservation(supabase, conv.conversationUuid, conv.conversationId, conv.firstMessage);
+        await autoExtractReservation(supabase, conv.conversationUuid, conv.conversationId, conv.allMessages);
       } catch (error) {
         console.error(`Failed to auto-extract for conversation ${conv.conversationId}:`, error);
       }
@@ -752,7 +939,7 @@ async function handleSyncConversation(req: Request, supabase: any) {
     const accessToken = await getAccessToken(supabase, mailbox_address);
 
     const inboxResponse = await fetch(
-      `https://graph.microsoft.com/v1.0/me/messages?$filter=conversationId eq '${conversation_id}'&$orderby=receivedDateTime desc`,
+      `https://graph.microsoft.com/v1.0/me/messages?$filter=conversationId eq '${conversation_id}'`,
       {
         headers: {
           Authorization: `Bearer ${accessToken}`,
@@ -777,7 +964,7 @@ async function handleSyncConversation(req: Request, supabase: any) {
     const inboxMessages = inboxData.value || [];
 
     const sentItemsResponse = await fetch(
-      `https://graph.microsoft.com/v1.0/me/mailFolders/SentItems/messages?$filter=conversationId eq '${conversation_id}'&$orderby=sentDateTime desc`,
+      `https://graph.microsoft.com/v1.0/me/mailFolders/SentItems/messages?$filter=conversationId eq '${conversation_id}'`,
       {
         headers: {
           Authorization: `Bearer ${accessToken}`,
@@ -878,6 +1065,12 @@ async function handleSyncConversation(req: Request, supabase: any) {
       if (!msgResult.error && msgResult.data) {
         syncedMessages.push(msgResult.data);
       }
+    }
+
+    try {
+      await autoExtractReservation(supabase, convResult.data.id, conversation_id, allMessages);
+    } catch (error) {
+      console.error(`Failed to auto-extract for conversation ${conversation_id}:`, error);
     }
 
     return new Response(

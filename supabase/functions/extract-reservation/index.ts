@@ -9,6 +9,7 @@ const corsHeaders = {
 
 interface ExtractRequest {
   emailContent: string;
+  reservationId?: string;
 }
 
 interface ReservationData {
@@ -19,6 +20,7 @@ interface ReservationData {
   adult_count: number | null;
   child_count: number | null;
   room_count: number | null;
+  additional_info: string | null;
 }
 
 Deno.serve(async (req: Request) => {
@@ -40,8 +42,9 @@ Deno.serve(async (req: Request) => {
     );
 
     console.log("Parsing request body");
-    const { emailContent }: ExtractRequest = await req.json();
+    const { emailContent, reservationId }: ExtractRequest = await req.json();
     console.log("Email content received, length:", emailContent?.length || 0);
+    console.log("Reservation ID:", reservationId || "none");
 
     if (!emailContent) {
       console.log("Error: Email content is missing");
@@ -55,6 +58,49 @@ Deno.serve(async (req: Request) => {
           },
         }
       );
+    }
+
+    // Check if we have an existing reservation with complete data
+    if (reservationId) {
+      console.log("Checking existing reservation data for ID:", reservationId);
+      const { data: existingReservation } = await supabaseClient
+        .from("reservations")
+        .select("arrival_date, departure_date, guest_name, adults, children, additional_info")
+        .eq("id", reservationId)
+        .maybeSingle();
+
+      if (existingReservation) {
+        console.log("Found existing reservation:", existingReservation);
+
+        // Check if all key fields are populated
+        const isComplete =
+          existingReservation.arrival_date !== null &&
+          existingReservation.departure_date !== null &&
+          existingReservation.guest_name !== null &&
+          existingReservation.adults !== null &&
+          existingReservation.children !== null &&
+          existingReservation.additional_info !== null;
+
+        if (isComplete) {
+          console.log("Reservation data is complete, skipping re-extraction");
+          return new Response(
+            JSON.stringify({
+              data: existingReservation,
+              skipped: true,
+              reason: "Reservation data already complete"
+            }),
+            {
+              status: 200,
+              headers: {
+                ...corsHeaders,
+                "Content-Type": "application/json",
+              },
+            }
+          );
+        } else {
+          console.log("Reservation data incomplete, proceeding with extraction");
+        }
+      }
     }
 
     console.log("Fetching OpenAI API key from settings");
@@ -105,6 +151,7 @@ Deno.serve(async (req: Request) => {
               "- adult_count: integer, or null",
               "- child_count: integer, or null",
               "- room_count: integer, or null",
+              "- additional_info: string with trip purpose, event names, special context, or null",
               "",
               "Rules:",
               "1) Output must be a single JSON object with EXACTLY these keys and no others.",
@@ -112,7 +159,8 @@ Deno.serve(async (req: Request) => {
               "3) If only nights are given without a departure date, leave departure_date as null.",
               "4) If counts are written in words (e.g. 'two adults'), convert to integers.",
               "5) If children ages are given, ignore ages; only extract child_count.",
-              "6) Do not guess; if unsure, use null."
+              "6) For additional_info, capture contextual details like event names (e.g., 'Mining Indaba'), trip purpose, special requests, or timing context (e.g., 'weekend stay'). Keep it concise.",
+              "7) Do not guess; if unsure, use null."
             ].join("\n")
           },
           {

@@ -301,6 +301,22 @@ Deno.serve(async (req: Request) => {
               },
             }
           );
+
+          // Check if send was successful before recording the message
+          if (!sendResponse.ok) {
+            const errorText = await sendResponse.text();
+            // Delete the draft if send failed
+            await fetch(
+              `https://graph.microsoft.com/v1.0/users/${mailbox_address}/messages/${draftReply.id}`,
+              {
+                method: "DELETE",
+                headers: {
+                  Authorization: `Bearer ${access_token}`,
+                },
+              }
+            ).catch(() => {/* Ignore delete errors */});
+            throw new Error(`Failed to send email: ${errorText}`);
+          }
         }
       }
     }
@@ -325,51 +341,9 @@ Deno.serve(async (req: Request) => {
       throw new Error(`Failed to send email: ${errorText}`);
     }
 
-    // Immediately insert the sent message into our database so it appears in the UI
-    // This will be updated with full Graph data when the sync runs
-    if (sentMessageId && conversationUuid) {
-      const now = new Date().toISOString();
-      const bodyContent = bodyHtml || bodyText || '';
-      const bodyPreview = bodyText?.substring(0, 150) || bodyHtml?.replace(/<[^>]*>/g, '').substring(0, 150) || '';
-
-      await supabase
-        .from("msgraph_messages")
-        .upsert({
-          msgraph_message_id: sentMessageId,
-          conversation_uuid: conversationUuid,
-          subject: subject,
-          from_email: mailbox_address,
-          from_name: mailbox_address,
-          to_emails: toRecipients,
-          body_preview: bodyPreview,
-          body_content: bodyContent,
-          received_at: now,
-          is_read: true,
-          has_attachments: (emailMessage.message.attachments?.length || 0) > 0,
-          importance: "normal",
-          raw_message: {
-            id: sentMessageId,
-            subject: subject,
-            from: { emailAddress: { address: mailbox_address, name: mailbox_address } },
-            toRecipients: toRecipients.map(email => ({ emailAddress: { address: email } })),
-            body: emailMessage.message.body,
-            sentDateTime: now,
-            isRead: true,
-          },
-        }, {
-          onConflict: 'msgraph_message_id'
-        });
-
-      // Update conversation last message time
-      await supabase
-        .from("msgraph_conversations")
-        .update({
-          last_message_at: now,
-          last_message_direction: 'outbound',
-          updated_at: now,
-        })
-        .eq("id", conversationUuid);
-    }
+    // Note: We don't insert the message locally here because MS Graph assigns a different
+    // message ID when the draft is sent vs. when it appears in Sent Items. This would create
+    // duplicates. Instead, we let the MS Graph sync handle adding the message naturally.
 
     // Record attachments that were sent with this message
     if (attachmentIds && attachmentIds.length > 0) {
