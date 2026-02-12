@@ -23,6 +23,217 @@ interface ReservationData {
   additional_info: string | null;
 }
 
+function buildSystemPrompt(missingHint?: string[]): string {
+  return [
+    "You are a hotel reservation assistant.",
+    "",
+    "Your job is to read reservation enquiry emails or email threads and extract structured reservation data.",
+    "",
+    "You MUST return ONLY a single valid JSON object.",
+    "Do NOT include markdown.",
+    "Do NOT include explanations.",
+    "Do NOT include extra keys.",
+    "Do NOT wrap JSON in text.",
+    "",
+    "The JSON must contain EXACTLY these keys:",
+    "arrival_date",
+    "departure_date",
+    "guest_name",
+    "guest_email",
+    "adult_count",
+    "child_count",
+    "room_count",
+    "additional_info",
+    "",
+    "--------------------------------",
+    "FIELD DEFINITIONS",
+    "--------------------------------",
+    "",
+    "arrival_date:",
+    "Check-in date.",
+    "Format: YYYY-MM-DD",
+    "If unknown -> null",
+    "",
+    "departure_date:",
+    "Check-out date.",
+    "Format: YYYY-MM-DD",
+    "If unknown -> null",
+    "",
+    "guest_name:",
+    "Primary guest or first named occupant.",
+    "If multiple guests listed -> use the first name listed.",
+    "If no name -> null",
+    "",
+    "guest_email:",
+    "Guest or sender email if present.",
+    "Else null.",
+    "",
+    "adult_count:",
+    "Total number of adults travelling or staying.",
+    "Infer from:",
+    "- Explicit counts",
+    "- Number of named occupants",
+    "Else null.",
+    "",
+    "child_count:",
+    "Number of children.",
+    "If not mentioned -> null.",
+    "",
+    "room_count:",
+    "Number of rooms requested or implied.",
+    "Infer from:",
+    "- '2 rooms'",
+    "- '2 single rooms'",
+    "- Number of room lines",
+    "Else null.",
+    "",
+    "additional_info:",
+    "Short summary (1-3 sentences max) including:",
+    "- Board basis (BB, HB, etc)",
+    "- Event or travel purpose",
+    "- Payment responsibility",
+    "- Special requests",
+    "Else null.",
+    "",
+    "--------------------------------",
+    "CRITICAL EXTRACTION RULES",
+    "--------------------------------",
+    "",
+    "GENERAL:",
+    "- NEVER guess.",
+    "- If unsure -> null.",
+    "- Convert written numbers to integers.",
+    "- Ignore ages of children.",
+    "",
+    "--------------------------------",
+    "DATE PARSING",
+    "--------------------------------",
+    "",
+    "Recognize formats:",
+    "- 09-12 FEB",
+    "- 9-12 Feb 2026",
+    "- 3 to 6 March",
+    "- 03/04/2026 - 07/04/2026",
+    "",
+    "Rules:",
+    "arrival_date = first date",
+    "departure_date = second date",
+    "",
+    "If month written once -> apply to both.",
+    "If year missing -> infer most likely future date.",
+    "",
+    "--------------------------------",
+    "ROOM COUNT RULES",
+    "--------------------------------",
+    "",
+    "If email says:",
+    "'2 rooms'",
+    "'2 single rooms'",
+    "'two double rooms'",
+    "-> room_count = 2",
+    "",
+    "If room lines exist:",
+    "Room 1: Name",
+    "Room 2: Name",
+    "-> room_count = number of room lines",
+    "",
+    "--------------------------------",
+    "ROOMING LIST / NAME RULES",
+    "--------------------------------",
+    "",
+    "If email lists occupants like:",
+    "",
+    "Room 1: John Smith",
+    "Room 2: Mary Jones",
+    "",
+    "OR",
+    "",
+    "Guests:",
+    "John Smith",
+    "Mary Jones",
+    "",
+    "Then:",
+    "adult_count = number of named people (unless explicit adult count overrides)",
+    "guest_name = FIRST listed person",
+    "",
+    "--------------------------------",
+    "PAYMENT & BOARD BASIS",
+    "--------------------------------",
+    "",
+    "Detect and add to additional_info:",
+    "",
+    "Board:",
+    "BB / Bed & Breakfast",
+    "HB / Half Board",
+    "FB / Full Board",
+    "",
+    "Payment:",
+    "Credit card",
+    "Company pay",
+    "Agent pay",
+    "Direct bill",
+    "",
+    "--------------------------------",
+    "EVENT / PURPOSE",
+    "--------------------------------",
+    "",
+    "If email mentions:",
+    "Conference",
+    "Wedding",
+    "Mining Indaba",
+    "Safari",
+    "Holiday",
+    "Business trip",
+    "-> Add short summary to additional_info.",
+    "",
+    "--------------------------------",
+    "MULTIPLE SIGNAL PRIORITY",
+    "--------------------------------",
+    "",
+    "If conflicting signals:",
+    "1) Explicit numbers win",
+    "2) Then room lines",
+    "3) Then name counts",
+    "",
+    "--------------------------------",
+    "OUTPUT REQUIREMENTS",
+    "--------------------------------",
+    "",
+    "Return ONLY JSON.",
+    "No commentary.",
+    "No markdown.",
+    ...(missingHint && missingHint.length
+      ? [
+          "",
+          "Important: this extraction is being re-run because some fields are missing.",
+          `Prioritize finding these fields if present: ${missingHint.join(', ')}.`,
+        ]
+      : []),
+  ].join("\n");
+}
+
+function getMissingHint(existingReservation: {
+  arrival_date: string | null;
+  departure_date: string | null;
+  guest_name: string | null;
+  guest_email: string | null;
+  adults: number | null;
+  children: number | null;
+  additional_info: string | null;
+}): string[] {
+  const missing: string[] = [];
+
+  if (!existingReservation.arrival_date) missing.push("arrival_date");
+  if (!existingReservation.departure_date) missing.push("departure_date");
+  if (!existingReservation.guest_name) missing.push("guest_name");
+  if (!existingReservation.guest_email) missing.push("guest_email");
+  if (existingReservation.adults === null) missing.push("adult_count");
+  if (existingReservation.children === null) missing.push("child_count");
+  if (!existingReservation.additional_info) missing.push("additional_info");
+
+  return missing;
+}
+
 Deno.serve(async (req: Request) => {
   console.log("extract-reservation function invoked", { method: req.method, url: req.url });
 
@@ -61,11 +272,12 @@ Deno.serve(async (req: Request) => {
     }
 
     // Check if we have an existing reservation with complete data
+    let missingHint: string[] | undefined;
     if (reservationId) {
       console.log("Checking existing reservation data for ID:", reservationId);
       const { data: existingReservation } = await supabaseClient
         .from("reservations")
-        .select("arrival_date, departure_date, guest_name, adults, children, additional_info")
+        .select("arrival_date, departure_date, guest_name, guest_email, adults, children, additional_info")
         .eq("id", reservationId)
         .maybeSingle();
 
@@ -98,7 +310,8 @@ Deno.serve(async (req: Request) => {
             }
           );
         } else {
-          console.log("Reservation data incomplete, proceeding with extraction");
+          missingHint = getMissingHint(existingReservation);
+          console.log("Reservation data incomplete, proceeding with extraction", { missingHint });
         }
       }
     }
@@ -139,29 +352,7 @@ Deno.serve(async (req: Request) => {
         messages: [
           {
             role: "system",
-            content: [
-              "You extract structured reservation enquiry data from an email.",
-              "Return ONLY valid JSON (no markdown, no commentary, no surrounding text).",
-              "",
-              "Extract these fields (use null if missing/unknown):",
-              "- arrival_date: string in ISO format YYYY-MM-DD, or null",
-              "- departure_date: string in ISO format YYYY-MM-DD, or null",
-              "- guest_name: string, or null",
-              "- guest_email: string (email), or null",
-              "- adult_count: integer, or null",
-              "- child_count: integer, or null",
-              "- room_count: integer, or null",
-              "- additional_info: string with trip purpose, event names, special context, or null",
-              "",
-              "Rules:",
-              "1) Output must be a single JSON object with EXACTLY these keys and no others.",
-              "2) If the email provides a date range like '3–6 March 2026', set arrival_date=2026-03-03 and departure_date=2026-03-06.",
-              "3) If only nights are given without a departure date, leave departure_date as null.",
-              "4) If counts are written in words (e.g. 'two adults'), convert to integers.",
-              "5) If children ages are given, ignore ages; only extract child_count.",
-              "6) For additional_info, capture contextual details like event names (e.g., 'Mining Indaba'), trip purpose, special requests, or timing context (e.g., 'weekend stay'). Keep it concise.",
-              "7) Do not guess; if unsure, use null."
-            ].join("\n")
+            content: buildSystemPrompt(missingHint)
           },
           {
             role: "user",
