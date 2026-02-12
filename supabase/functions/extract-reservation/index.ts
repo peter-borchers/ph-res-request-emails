@@ -235,116 +235,105 @@ function getMissingHint(existingReservation: {
 }
 
 Deno.serve(async (req: Request) => {
-  console.log("extract-reservation function invoked", { method: req.method, url: req.url });
+  console.log("extract-reservation invoked", { method: req.method, url: req.url });
 
   if (req.method === "OPTIONS") {
-    console.log("Handling OPTIONS preflight request");
-    return new Response(null, {
-      status: 200,
-      headers: corsHeaders,
-    });
+    return new Response(null, { status: 200, headers: corsHeaders });
   }
 
   try {
-    console.log("Creating Supabase client");
-    const supabaseClient = createClient(
-      Deno.env.get("SUPABASE_URL") ?? "",
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
-    );
+    // Create Supabase client
+    const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
+    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 
-    console.log("Parsing request body");
-    const { emailContent, reservationId }: ExtractRequest = await req.json();
-    console.log("Email content received, length:", emailContent?.length || 0);
-    console.log("Reservation ID:", reservationId || "none");
-
-    if (!emailContent) {
-      console.log("Error: Email content is missing");
+    if (!supabaseUrl || !serviceRoleKey) {
+      console.error("Missing env vars", {
+        hasSupabaseUrl: Boolean(supabaseUrl),
+        hasServiceRoleKey: Boolean(serviceRoleKey),
+      });
       return new Response(
-        JSON.stringify({ error: "Email content is required" }),
-        {
-          status: 400,
-          headers: {
-            ...corsHeaders,
-            "Content-Type": "application/json",
-          },
-        }
+        JSON.stringify({ error: "Supabase env vars missing (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)" }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
     // Check if we have an existing reservation with complete data
     let missingHint: string[] | undefined;
     if (reservationId) {
-      console.log("Checking existing reservation data for ID:", reservationId);
-      const { data: existingReservation } = await supabaseClient
+      const { data: existingReservation, error: existingErr } = await supabaseClient
         .from("reservations")
         .select("arrival_date, departure_date, guest_name, guest_email, adults, children, additional_info")
         .eq("id", reservationId)
         .maybeSingle();
 
-      if (existingReservation) {
-        console.log("Found existing reservation:", existingReservation);
+      if (existingErr) {
+        console.warn("Failed to read existing reservation; proceeding anyway", existingErr);
+      } else if (existingReservation) {
+        if (isReservationKeyDataComplete(existingReservation)) {
+          console.log("Key fields already present; skipping re-extraction", { reservationId });
 
-        // Check if all key fields are populated
-        const isComplete =
-          existingReservation.arrival_date !== null &&
-          existingReservation.departure_date !== null &&
-          existingReservation.guest_name !== null &&
-          existingReservation.adults !== null &&
-          existingReservation.children !== null &&
-          existingReservation.additional_info !== null;
+          // Keep return shape: { data: ... } plus skipped fields
+          // Map existing fields into the ReservationData interface
+          const mapped: ReservationData = ensureReservationDataShape({
+            arrival_date: existingReservation.arrival_date ?? null,
+            departure_date: existingReservation.departure_date ?? null,
+            guest_name: existingReservation.guest_name ?? null,
+            guest_email: existingReservation.guest_email ?? null,
+            adult_count: existingReservation.adults ?? null,
+            child_count: existingReservation.children ?? null,
+            room_count: null, // not stored on reservation row in your query
+            additional_info: existingReservation.additional_info ?? null,
+          });
 
-        if (isComplete) {
-          console.log("Reservation data is complete, skipping re-extraction");
           return new Response(
             JSON.stringify({
-              data: existingReservation,
+              data: mapped,
               skipped: true,
-              reason: "Reservation data already complete"
+              reason: "Reservation key fields already present",
             }),
-            {
-              status: 200,
-              headers: {
-                ...corsHeaders,
-                "Content-Type": "application/json",
-              },
-            }
+            { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
           );
         } else {
           missingHint = getMissingHint(existingReservation);
           console.log("Reservation data incomplete, proceeding with extraction", { missingHint });
         }
+
+        missingHint = missingKeyFields(existingReservation);
+        console.log("Reservation incomplete; will re-run extraction", { reservationId, missingHint });
       }
     }
 
-    console.log("Fetching OpenAI API key from settings");
-    const { data: settings } = await supabaseClient
+    // Fetch OpenAI API key
+    const { data: settings, error: settingsErr } = await supabaseClient
       .from("settings")
       .select("openai_api_key")
       .maybeSingle();
 
-    const apiKey = settings?.openai_api_key;
-
-    if (!apiKey) {
-      console.log("Error: OpenAI API key not configured");
-      return new Response(
-        JSON.stringify({
-          error: "OpenAI API key not configured. Please add it in Admin Settings."
-        }),
-        {
-          status: 400,
-          headers: {
-            ...corsHeaders,
-            "Content-Type": "application/json",
-          },
-        }
-      );
+    if (settingsErr) {
+      console.error("Failed to read settings", settingsErr);
+      return new Response(JSON.stringify({ error: "Failed to read settings" }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
-    console.log("Calling OpenAI API to extract reservation data");
-    const openaiResponse = await fetch("https://api.openai.com/v1/chat/completions", {
+    const apiKey = settings?.openai_api_key;
+    if (!apiKey) {
+      return new Response(JSON.stringify({ error: "OpenAI API key not configured. Please add it in Admin Settings." }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // Call OpenAI (Responses API) with strict JSON schema
+    const sysPrompt = buildSystemPrompt(missingHint);
+
+    console.log("Calling OpenAI Responses API", { model: "gpt-4.1-mini" });
+
+    const openaiResponse = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -360,79 +349,95 @@ Deno.serve(async (req: Request) => {
           }
         ],
         temperature: 0.1,
+        input: [
+          { role: "system", content: [{ type: "input_text", text: sysPrompt }] },
+          { role: "user", content: [{ type: "input_text", text: emailContent }] },
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "reservation_enquiry_extract",
+            strict: true,
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                arrival_date: { type: ["string", "null"] },
+                departure_date: { type: ["string", "null"] },
+                guest_name: { type: ["string", "null"] },
+                guest_email: { type: ["string", "null"] },
+                adult_count: { type: ["integer", "null"] },
+                child_count: { type: ["integer", "null"] },
+                room_count: { type: ["integer", "null"] },
+                additional_info: { type: ["string", "null"] },
+              },
+              required: [
+                "arrival_date",
+                "departure_date",
+                "guest_name",
+                "guest_email",
+                "adult_count",
+                "child_count",
+                "room_count",
+                "additional_info",
+              ],
+            },
+          },
+        },
       }),
     });
 
+
     if (!openaiResponse.ok) {
       const errorText = await openaiResponse.text();
-      console.error("OpenAI API error:", { status: openaiResponse.status, error: errorText });
-      return new Response(
-        JSON.stringify({
-          error: "Failed to extract data from OpenAI",
-          details: errorText
-        }),
-        {
-          status: 500,
-          headers: {
-            ...corsHeaders,
-            "Content-Type": "application/json",
-          },
-        }
-      );
+      console.error("OpenAI API error", { status: openaiResponse.status, errorText });
+      return new Response(JSON.stringify({ error: "Failed to extract data from OpenAI", details: errorText }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
-    console.log("OpenAI API call successful");
     const openaiData = await openaiResponse.json();
-    const extractedText = (openaiData.choices[0]?.message?.content || "{}").trim();
-    console.log("Extracted text from OpenAI:", extractedText);
+    const extractedText = getResponsesApiOutputText(openaiData);
 
-    let reservationData: ReservationData;
-    try {
-      reservationData = JSON.parse(extractedText);
-      console.log("Successfully parsed reservation data:", reservationData);
-    } catch (parseError) {
-      console.error("Failed to parse OpenAI response:", extractedText);
-      return new Response(
-        JSON.stringify({
-          error: "Failed to parse extracted data",
-          rawResponse: extractedText
-        }),
-        {
-          status: 500,
-          headers: {
-            ...corsHeaders,
-            "Content-Type": "application/json",
-          },
-        }
-      );
+    console.log("OpenAI extraction received", { length: extractedText.length });
+
+    if (!extractedText) {
+      console.error("OpenAI returned empty output_text", { openaiData });
+      return new Response(JSON.stringify({ error: "OpenAI returned empty extraction", details: openaiData }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
-    console.log("Returning successful response");
-    return new Response(
-      JSON.stringify({ data: reservationData }),
-      {
-        status: 200,
-        headers: {
-          ...corsHeaders,
-          "Content-Type": "application/json",
-        },
-      }
-    );
+    let parsed: any;
+    try {
+      parsed = JSON.parse(extractedText);
+    } catch {
+      console.error("Failed to parse OpenAI JSON", { extractedText });
+      return new Response(JSON.stringify({ error: "Failed to parse extracted data", rawResponse: extractedText }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
 
+    const reservationData: ReservationData = ensureReservationDataShape(parsed);
+
+    console.log("Returning successful response", reservationData);
+
+    // MUST match current return type/shape:
+    return new Response(JSON.stringify({ data: reservationData }), {
+      status: 200,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
   } catch (error) {
     console.error("Error in extract-reservation function:", error);
     return new Response(
       JSON.stringify({
         error: "Internal server error",
-        message: error instanceof Error ? error.message : "Unknown error"
+        message: error instanceof Error ? error.message : "Unknown error",
       }),
-      {
-        status: 500,
-        headers: {
-          ...corsHeaders,
-          "Content-Type": "application/json",
-        },
-      }
+      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   }
 });

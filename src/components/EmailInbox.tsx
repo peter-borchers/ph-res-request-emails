@@ -266,10 +266,10 @@ export function EmailInbox({ selectedEmailId, onSelectEmail, refreshTrigger }: E
             <button
               key={conversation.id}
               onClick={() => onSelectEmail(conversation)}
-              className={`w-full text-left p-4 border-b transition-all ${
+              className={`w-full text-left p-4 border-b-2 transition-all ${
                 selectedEmailId === conversation.id
-                  ? 'bg-sky-50 border-slate-200 border-l-4 border-l-sky-600 shadow-sm'
-                  : 'bg-white border-slate-100 hover:bg-slate-50'
+                  ? 'bg-sky-50 border-sky-300 border-l-4 border-l-sky-600 shadow-sm'
+                  : 'bg-white border-slate-300 hover:bg-slate-50'
               }`}
             >
               <div className="flex items-start justify-between mb-2">
