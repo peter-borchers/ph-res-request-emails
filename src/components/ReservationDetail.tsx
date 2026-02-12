@@ -540,6 +540,8 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
 
     setSendingDraft(draft.id);
 
+    await supabase.from('email_drafts').update({ status: 'sending' }).eq('id', draft.id);
+
     try {
       const apiUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/send-email`;
       const response = await fetch(apiUrl, {
@@ -566,10 +568,13 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
         throw new Error(errorData.error || 'Failed to send email');
       }
 
-      await supabase
-        .from('email_drafts')
-        .delete()
-        .eq('id', draft.id);
+      // 3) mark sent
+      await supabase.from('email_drafts').update({
+        status: 'sent',
+        sent_at: new Date().toISOString(),
+        error_message: null,
+        updated_at: new Date().toISOString(),
+      }).eq('id', draft.id);
 
       await loadEmailDrafts(reservationId);
       await refreshMessageHistory();
@@ -578,6 +583,8 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
         onReservationUpdate();
       }
 
+      setEmailDrafts(prev => prev.filter(d => d.id !== draft.id));
+      
       alert('Email sent successfully!');
     } catch (error) {
       console.error('Error sending draft:', error);
@@ -1670,7 +1677,10 @@ ${message.body_content || message.body_preview}`,
         {!showCompose && messages.length > 0 && (
           <div className="mt-4 mb-4">
             <button
-              onClick={() => setShowCompose(true)}
+              onClick={() => {
+                setShowCompose(true);
+                setHasManualEdit(false);
+              }}
               className="w-full px-4 py-2.5 bg-sky-600 text-white rounded-lg hover:bg-sky-700 transition-all font-bold flex items-center justify-center gap-2 shadow-sm"
             >
               <Send className="w-4 h-4" />
