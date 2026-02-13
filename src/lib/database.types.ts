@@ -17,22 +17,8 @@ export interface Database {
           guest_email: string | null
           arrival_date: string | null
           departure_date: string | null
-          nights: number | null
-          phone: string | null
           adults: number
           children: number
-          rooms: number | null
-          source_channel: string | null
-          travel_agent_company: string | null
-          property_id: string | null
-          confirmation_no: string | null
-          extracted_json: Json | null
-          extra: Json | null
-          extraction_confidence: Json | null
-          last_extraction_attempted_at: string | null
-          last_extracted_message_at: string | null
-          last_extraction_error: string | null
-          extraction_version: string | null
           room_types: string[]
           room_details: Json | null
           nightly_rate_currency: string
@@ -49,22 +35,8 @@ export interface Database {
           guest_email?: string | null
           arrival_date?: string | null
           departure_date?: string | null
-          nights?: number | null
-          phone?: string | null
           adults?: number
           children?: number
-          rooms?: number | null
-          source_channel?: string | null
-          travel_agent_company?: string | null
-          property_id?: string | null
-          confirmation_no?: string | null
-          extracted_json?: Json | null
-          extra?: Json | null
-          extraction_confidence?: Json | null
-          last_extraction_attempted_at?: string | null
-          last_extracted_message_at?: string | null
-          last_extraction_error?: string | null
-          extraction_version?: string | null
           room_types?: string[]
           room_details?: Json | null
           nightly_rate_currency?: string
@@ -81,22 +53,8 @@ export interface Database {
           guest_email?: string | null
           arrival_date?: string | null
           departure_date?: string | null
-          nights?: number | null
-          phone?: string | null
           adults?: number
           children?: number
-          rooms?: number | null
-          source_channel?: string | null
-          travel_agent_company?: string | null
-          property_id?: string | null
-          confirmation_no?: string | null
-          extracted_json?: Json | null
-          extra?: Json | null
-          extraction_confidence?: Json | null
-          last_extraction_attempted_at?: string | null
-          last_extracted_message_at?: string | null
-          last_extraction_error?: string | null
-          extraction_version?: string | null
           room_types?: string[]
           room_details?: Json | null
           nightly_rate_currency?: string

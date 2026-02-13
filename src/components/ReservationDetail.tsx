@@ -13,6 +13,16 @@ type RoomType = Database['public']['Tables']['room_types']['Row'];
 type RoomProposal = Database['public']['Tables']['room_proposals']['Row'];
 type TemplateAttachment = Database['public']['Tables']['template_attachments']['Row'];
 type EmailDraft = Database['public']['Tables']['email_drafts']['Row'];
+type RequestedRoom = {
+  id: string;
+  room_no: number | null;
+  guest_name: string | null;
+  requested_room_type_raw: string | null;
+  requested_features: string[];
+  adults: number | null;
+  children: number | null;
+};
+
 
 interface SelectedRoom {
   code: string;
@@ -27,17 +37,19 @@ interface ReservationDetailProps {
 }
 
 export function ReservationDetail({ conversation, onReservationUpdate }: ReservationDetailProps) {
-  const [reservation, setReservation] = useState<Partial<Reservation>>({
-    guest_name: '',
-    arrival_date: '',
-    departure_date: '',
-    adults: 2,
-    children: 0,
-    room_types: [],
-    nightly_rate_currency: 'ZAR',
-    nightly_rate_amount: 0,
-    archived: false,
-  });
+const [reservation, setReservation] = useState<Partial<Reservation>>({
+  requester_name: "",
+  requester_email: "",
+  arrival_date: "",
+  departure_date: "",
+  adults: 2,
+  children: 0,
+  room_count: 1,
+  nightly_rate_currency: "ZAR",
+  nightly_rate_amount: 0,
+  additional_info: "",
+  archived: false,
+});
   const [roomCount, setRoomCount] = useState<number>(1);
 
   const [selectedTemplate, setSelectedTemplate] = useState<string>('');
@@ -79,6 +91,8 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
   const [emailDrafts, setEmailDrafts] = useState<EmailDraft[]>([]);
   const [sendingDraft, setSendingDraft] = useState<string | null>(null);
   const [sendingEmail, setSendingEmail] = useState(false);
+  const [requestedRooms, setRequestedRooms] = useState<RequestedRoom[]>([]);
+
 
   useEffect(() => {
     loadTemplates();
@@ -99,6 +113,108 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
       setBookingUrlTemplate(data.booking_url_template);
     }
   }
+  
+  function mapRequestedTypeToRoomTypeCode(
+  requestedTypeRaw: string | null | undefined,
+  roomTypes: { code: string; name: string }[]
+): string | null {
+  if (!requestedTypeRaw) return null;
+
+  const norm = requestedTypeRaw.trim().toLowerCase();
+
+  // simple heuristics – tune for your environment / codes
+  const candidates = [
+    { match: ["single"], pick: (rt: any) => rt.name.toLowerCase().includes("single") || rt.code.toLowerCase().includes("sng") },
+    { match: ["double", "dbl"], pick: (rt: any) => rt.name.toLowerCase().includes("double") || rt.code.toLowerCase().includes("dbl") },
+    { match: ["twin"], pick: (rt: any) => rt.name.toLowerCase().includes("twin") || rt.code.toLowerCase().includes("twn") },
+    { match: ["suite"], pick: (rt: any) => rt.name.toLowerCase().includes("suite") || rt.code.toLowerCase().includes("ste") },
+    { match: ["family"], pick: (rt: any) => rt.name.toLowerCase().includes("family") },
+  ];
+
+  for (const rule of candidates) {
+    if (rule.match.some((m) => norm.includes(m))) {
+      const found = roomTypes.find(rule.pick);
+      if (found) return found.code;
+    }
+  }
+
+  // fallback: try a direct code match
+  const direct = roomTypes.find((rt) => rt.code.toLowerCase() === norm);
+  return direct?.code ?? null;
+}
+
+function findBestRoomTypeMatch(
+  requestedTypeRaw: string,
+  roomTypes: { code: string; name: string }[]
+) {
+  const norm = (s: string) => s.trim().toLowerCase();
+  const req = norm(requestedTypeRaw);
+
+  // common aliases
+  const aliases: Record<string, string[]> = {
+    single: ["single", "sgl", "sng", "snl"],
+    double: ["double", "dbl", "db"],
+    twin: ["twin", "twn"],
+    suite: ["suite", "ste"],
+  };
+
+  const tokens = aliases[req] ?? [req];
+
+  const match = roomTypes.find(rt =>
+    tokens.some(t => norm(rt.code).includes(t) || norm(rt.name).includes(t))
+  );
+
+  return match ?? null;
+}
+
+function openProposalFromRequestedRooms() {
+  console.log("[proposal] requestedRooms at click:", requestedRooms);
+  console.log("[proposal] roomTypes at click:", roomTypes);
+
+  setShowProposalModal(true);
+  setEditingProposal(null);
+  setProposalName(`Option ${roomProposals.length + 1}`);
+
+  if (!Array.isArray(requestedRooms) || requestedRooms.length === 0) {
+    console.warn("[proposal] No requestedRooms to prefill");
+    setProposalRooms([]);
+    return;
+  }
+
+  // Group requested rooms by requested_room_type_raw (e.g. "single")
+  const grouped = new Map<string, number>();
+  for (const rr of requestedRooms) {
+    const key = (rr.requested_room_type_raw ?? "unknown").trim().toLowerCase() || "unknown";
+    grouped.set(key, (grouped.get(key) ?? 0) + 1);
+  }
+
+  // Build proposal lines
+  const lines = Array.from(grouped.entries()).map(([reqType, qty]) => {
+    const matched = reqType !== "unknown"
+      ? findBestRoomTypeMatch(reqType, roomTypes)
+      : null;
+
+    // If we can map to a real room_type, use it.
+    // If not, use a placeholder code that will still render a row
+    // and force the user to choose a real type before saving.
+    const code = matched?.code ?? `REQ_${reqType.toUpperCase()}`;
+    const name = matched?.name ?? `Requested: ${reqType}`;
+
+    return {
+      code,
+      name,
+      quantity: qty,
+      nightly_rate: 0,
+      // optional helper field if you want to display it (won't break UI if ignored)
+      requested_type: reqType,
+      needs_mapping: !matched,
+    };
+  });
+
+  console.log("[proposal] prefilled proposalRooms lines:", lines);
+  setProposalRooms(lines);
+}
+
 
   function generateBookingUrl(): string {
     if (!bookingUrlTemplate) return '';
@@ -109,7 +225,7 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
     let url = bookingUrlTemplate;
     url = url.replace(/\{\{adultCount\}\}/g, String(reservation.adults || 0));
     url = url.replace(/\{\{childCount\}\}/g, String(reservation.children || 0));
-    url = url.replace(/\{\{roomCount\}\}/g, String(roomCount));
+    url = url.replace(/\{\{roomCount\}\}/g, String(reservation.room_count || 1));
     url = url.replace(/\{\{arrivalDate\}\}/g, arrivalDate);
     url = url.replace(/\{\{departureDate\}\}/g, departureDate);
 
@@ -748,62 +864,106 @@ export function ReservationDetail({ conversation, onReservationUpdate }: Reserva
     }
   }
 
-  async function loadReservationData(conversationId: string) {
-    setHasUnsavedChanges(false);
+ async function loadReservationData(conversationId: string) {
+  setHasUnsavedChanges(false);
 
-    const { data: existingReservation } = await supabase
-      .from('reservations')
-      .select('*')
-      .eq('conversation_id', conversationId)
-      .maybeSingle();
+  // 1) Load reservation header
+  const { data: existingReservation, error: resErr } = await supabase
+    .from("reservations")
+    .select("*")
+    .eq("conversation_id", conversationId)
+    .maybeSingle();
 
-    if (existingReservation) {
-      setReservationId(existingReservation.id);
-      setReservation({
-        guest_name: existingReservation.guest_name,
-        arrival_date: existingReservation.arrival_date,
-        departure_date: existingReservation.departure_date,
-        adults: existingReservation.adults,
-        children: existingReservation.children,
-        room_types: existingReservation.room_types || [],
-        nightly_rate_currency: existingReservation.nightly_rate_currency,
-        nightly_rate_amount: existingReservation.nightly_rate_amount,
-        additional_info: existingReservation.additional_info || '',
-        archived: existingReservation.archived ?? false,
-      });
-
-      if (existingReservation.room_details && existingReservation.room_details.length > 0) {
-        setSelectedRooms(existingReservation.room_details);
-      } else if (existingReservation.room_types && existingReservation.room_types.length > 0) {
-        const roomsFromDb = existingReservation.room_types.map((code: string) => {
-          const roomType = roomTypes.find(rt => rt.code === code);
-          return {
-            code,
-            name: roomType?.name || code,
-            quantity: 1,
-            nightly_rate: 0
-          };
-        });
-        setSelectedRooms(roomsFromDb);
-      } else {
-        setSelectedRooms([]);
-      }
-    } else {
-      setReservationId(null);
-      setReservation({
-        guest_name: '',
-        arrival_date: '',
-        departure_date: '',
-        adults: 2,
-        children: 0,
-        room_types: [],
-        nightly_rate_currency: 'ZAR',
-        nightly_rate_amount: 0,
-        archived: false,
-      });
-      setSelectedRooms([]);
-    }
+  if (resErr) {
+    console.error("Failed to load reservation:", resErr);
   }
+
+  if (!existingReservation) {
+    // Reset state for a new/empty conversation
+    setReservationId(null);
+    setReservation({
+      requester_name: "",
+      requester_email: "",
+      arrival_date: "",
+      departure_date: "",
+      adults: 2,
+      children: 0,
+	  room_count: 1,
+      nightly_rate_currency: "ZAR",
+      nightly_rate_amount: 0,
+      additional_info: "",
+      archived: false,
+    });
+
+    setRequestedRooms([]);
+    setSelectedRooms([]);
+    return;
+  }
+
+  setReservationId(existingReservation.id);
+
+  // 2) Load requested rooms from reservation_room_request
+  const { data: rrRows, error: rrErr } = await supabase
+    .from("reservation_room_request")
+    .select(
+      "id, room_no, guest_name, requested_room_type_raw, requested_features, adults, children"
+    )
+    .eq("reservation_id", existingReservation.id)
+    .order("room_no", { ascending: true });
+
+  if (rrErr) {
+    console.error("Failed to load reservation_room_request:", rrErr);
+    setRequestedRooms([]);
+  } else {
+    setRequestedRooms(
+      (rrRows ?? []).map((r: any) => ({
+        id: r.id,
+        room_no: r.room_no ?? null,
+        guest_name: r.guest_name ?? null,
+        requested_room_type_raw: r.requested_room_type_raw ?? null,
+        requested_features: Array.isArray(r.requested_features) ? r.requested_features : [],
+        adults: r.adults ?? null,
+        children: r.children ?? null,
+      }))
+    );
+  }
+
+  // 3) Set header reservation state (requester fields, not guest)
+  setReservation({
+    requester_name: existingReservation.requester_name ?? "",
+    requester_email: existingReservation.requester_email ?? "",
+    arrival_date: existingReservation.arrival_date ?? "",
+    departure_date: existingReservation.departure_date ?? "",
+    adults: existingReservation.adults ?? 0,
+    children: existingReservation.children ?? 0,
+	room_count: existingReservation.room_count ?? 1,
+    nightly_rate_currency: existingReservation.nightly_rate_currency ?? "ZAR",
+    nightly_rate_amount: existingReservation.nightly_rate_amount ?? 0,
+    additional_info: existingReservation.additional_info ?? "",
+    archived: existingReservation.archived ?? false,
+  });
+
+  // 4) Keep your existing SelectedRooms logic for proposals (legacy)
+  //    (I’d recommend you remove this later and drive proposals purely from room_proposals.)
+  if (Array.isArray(existingReservation.room_details) && existingReservation.room_details.length > 0) {
+    setSelectedRooms(existingReservation.room_details);
+  } else if (Array.isArray(existingReservation.room_types) && existingReservation.room_types.length > 0) {
+    const roomsFromDb = existingReservation.room_types.map((code: string) => {
+      const roomType = roomTypes.find((rt) => rt.code === code);
+      return {
+        code,
+        name: roomType?.name || code,
+        quantity: 1,
+        nightly_rate: 0,
+      };
+    });
+    setSelectedRooms(roomsFromDb);
+  } else {
+    setSelectedRooms([]);
+  }
+}
+
+
 
   async function saveReservation() {
     if (!conversation) return;
@@ -1215,6 +1375,51 @@ ${message.body_content || message.body_preview}`,
     const departure = new Date(reservation.departure_date);
     return Math.ceil((departure.getTime() - arrival.getTime()) / (1000 * 60 * 60 * 24));
   };
+  
+  const hasUnmappedRooms = proposalRooms.some(
+  r => typeof r.code === "string" && r.code.startsWith("REQ_")
+);
+
+function removeProposalRoom(code: string) {
+  setProposalRooms(prev => prev.filter(r => r.code !== code));
+}
+
+function addOrMergeProposalRoom(
+  next: { code: string; name: string; quantity: number; nightly_rate: number },
+  requestedType?: string // e.g. "single"
+) {
+  setProposalRooms(prev => {
+    const out = [...prev];
+
+    // If we’re mapping from a placeholder type, remove placeholder and transfer quantity
+    if (requestedType) {
+      const placeholderCode = `REQ_${requestedType.trim().toUpperCase()}`;
+      const placeholderIdx = out.findIndex(r => r.code === placeholderCode);
+
+      if (placeholderIdx >= 0) {
+        const placeholder = out[placeholderIdx];
+        out.splice(placeholderIdx, 1);
+
+        // carry quantity forward if placeholder had it
+        next = { ...next, quantity: Math.max(next.quantity, placeholder.quantity ?? 1) };
+      }
+    }
+
+    // Merge into existing real row if present
+    const existingIdx = out.findIndex(r => r.code === next.code);
+    if (existingIdx >= 0) {
+      out[existingIdx] = {
+        ...out[existingIdx],
+        quantity: (out[existingIdx].quantity ?? 1) + (next.quantity ?? 1),
+      };
+      return out;
+    }
+
+    out.push(next);
+    return out;
+  });
+}
+
 
   return (
     <div className="flex-1 flex flex-col bg-slate-50 h-screen overflow-hidden">
@@ -1272,15 +1477,23 @@ ${message.body_content || message.body_preview}`,
           <div className="grid grid-cols-12 gap-4">
             {/* Guest Info */}
             <div className="col-span-2">
-              <label className="block text-xs font-semibold text-slate-600 mb-1">Guest Name</label>
+              <label className="block text-xs font-semibold text-slate-600 mb-1">Enquirer Name</label>
               <input
                 type="text"
-                value={reservation.guest_name || ''}
-                onChange={(e) => updateReservation({ guest_name: e.target.value })}
+                value={reservation.requester_name || ''}
+                onChange={(e) => updateReservation({ requester_name: e.target.value })}
                 className="w-full px-2.5 py-1.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-sky-500 focus:border-sky-500 transition-all text-sm"
               />
             </div>
-
+<div className="col-span-2">
+              <label className="block text-xs font-semibold text-slate-600 mb-1">Enquirer Email</label>
+              <input
+                type="text"
+                value={reservation.requester_email || ''}
+                onChange={(e) => updateReservation({ requester_email: e.target.value })}
+                className="w-full px-2.5 py-1.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-sky-500 focus:border-sky-500 transition-all text-sm"
+              />
+            </div>
             {/* Arrival Date */}
             <div className="col-span-2">
               <label className="block text-xs font-semibold text-slate-600 mb-1">Arrival</label>
@@ -1333,7 +1546,7 @@ ${message.body_content || message.body_preview}`,
               <input
                 type="number"
                 min="1"
-                value={roomCount}
+                value={reservation.room_count}
                 onChange={(e) => setRoomCount(parseInt(e.target.value) || 1)}
                 className="w-20 px-2.5 py-1.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-sky-500 focus:border-sky-500 transition-all text-sm"
               />
@@ -1354,6 +1567,104 @@ ${message.body_content || message.body_preview}`,
               </div>
             )}
           </div>
+
+{/* Requested Room Details */}
+<div className="mt-4 border-t border-slate-200 pt-4">
+  <div className="flex items-center justify-between mb-2">
+    <div>
+      <h3 className="text-sm font-semibold text-slate-800">Requested Room Details</h3>
+      <p className="text-xs text-slate-500">
+        Parsed from the email. Use this to build proposals.
+      </p>
+    </div>
+
+    {/* Optional: quick action */}
+    <button
+  type="button"
+  onClick={openProposalFromRequestedRooms}
+  disabled={requestedRooms.length === 0}
+  className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-slate-300 hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed"
+>
+  Create Proposal from Request
+</button>
+
+  </div>
+
+  {requestedRooms.length === 0 ? (
+    <div className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-lg p-3">
+      No requested rooms found yet. Run extraction or check the conversation.
+    </div>
+  ) : (
+    <div className="overflow-x-auto border border-slate-200 rounded-lg">
+      <table className="min-w-full text-sm">
+        <thead className="bg-slate-50">
+          <tr className="text-left text-xs font-semibold text-slate-600">
+            <th className="px-3 py-2 w-16">Room</th>
+            <th className="px-3 py-2">Guest</th>
+            <th className="px-3 py-2 w-36">Requested Type</th>
+            <th className="px-3 py-2">Features</th>
+            <th className="px-3 py-2 w-20 text-right">Adults</th>
+            <th className="px-3 py-2 w-20 text-right">Children</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-slate-200">
+          {requestedRooms.map((r, idx) => (
+            <tr key={r.id} className="hover:bg-slate-50">
+              <td className="px-3 py-2 text-xs text-slate-500">
+                {r.room_no ?? idx + 1}
+              </td>
+
+              <td className="px-3 py-2">
+                <div className="font-medium text-slate-800">
+                  {r.guest_name ?? <span className="text-slate-400">—</span>}
+                </div>
+              </td>
+
+              <td className="px-3 py-2">
+                {r.requested_room_type_raw ? (
+                  <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-slate-100 text-slate-700 text-xs">
+                    {r.requested_room_type_raw}
+                  </span>
+                ) : (
+                  <span className="text-slate-400">—</span>
+                )}
+              </td>
+
+              <td className="px-3 py-2">
+                {Array.isArray(r.requested_features) && r.requested_features.length > 0 ? (
+                  <div className="flex flex-wrap gap-1">
+                    {r.requested_features.map((f, i) => (
+                      <span
+                        key={`${r.id}-f-${i}`}
+                        className="inline-flex items-center px-2 py-0.5 rounded-md bg-sky-50 text-sky-700 text-xs border border-sky-100"
+                      >
+                        {f}
+                      </span>
+                    ))}
+                  </div>
+                ) : (
+                  <span className="text-slate-400">—</span>
+                )}
+              </td>
+
+              <td className="px-3 py-2 text-right">
+                {r.adults ?? <span className="text-slate-400">—</span>}
+              </td>
+
+              <td className="px-3 py-2 text-right">
+                {r.children ?? <span className="text-slate-400">—</span>}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )}
+</div>
+
+
+
+
 
           {/* Room Proposals */}
           <div className="mt-3">
@@ -1411,7 +1722,10 @@ ${message.body_content || message.body_preview}`,
                             <span className="text-slate-700">{room.quantity}x {room.name}</span>
                             <span className="text-slate-600">@</span>
                             <span className="font-semibold text-slate-900">R{room.nightly_rate}/night</span>
+							
+
                           </div>
+						  
                         ))}
                       </div>
                       <div className="mt-2 pt-2 border-t border-slate-200 flex justify-between items-center text-xs">
@@ -2086,7 +2400,20 @@ ${message.body_content || message.body_preview}`,
                   {roomTypes.map((roomType) => (
                     <button
                       key={roomType.code}
-                      onClick={() => toggleProposalRoom(roomType)}
+                    onClick={() => {
+  // If there is a REQ_SINGLE placeholder, and user clicks a real room type,
+  // treat it as mapping the request to this room type.
+  // You can infer requestedType from any placeholder currently present.
+  const requestedType = proposalRooms.find(r => r.code?.startsWith("REQ_"))
+    ? proposalRooms.find(r => r.code?.startsWith("REQ_"))!.code.replace("REQ_", "").toLowerCase()
+    : undefined;
+
+  addOrMergeProposalRoom(
+    { code: roomType.code, name: roomType.name, quantity: 1, nightly_rate: 0 },
+    requestedType
+  );
+}}
+
                       className={`px-3 py-1.5 border rounded-lg font-semibold text-sm transition-all ${
                         proposalRooms.some(r => r.code === roomType.code)
                           ? 'bg-sky-600 text-white border-sky-600 shadow-sm'
@@ -2106,6 +2433,12 @@ ${message.body_content || message.body_preview}`,
                   <div className="space-y-2">
                     {proposalRooms.map((room) => (
                       <div key={room.code} className="bg-slate-50 rounded-lg border border-slate-200 p-3 flex items-center gap-3">
+					  {room.code.startsWith("REQ_") && (
+  <span className="ml-2 text-[10px] px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 font-bold">
+    Requested
+  </span>
+)}
+
                         <div className="font-semibold text-slate-900 text-sm min-w-[80px]">
                           {room.code}
                         </div>
@@ -2132,7 +2465,17 @@ ${message.body_content || message.body_preview}`,
                           />
                           <span className="text-xs text-slate-600">ZAR/night</span>
                         </div>
+						<button
+  type="button"
+  onClick={() => removeProposalRoom(room.code)}
+  className="ml-2 px-2.5 py-1.5 border border-slate-300 rounded-lg text-slate-700 hover:border-red-300 hover:text-red-600 transition-all text-xs font-semibold"
+  title="Remove this room from the proposal"
+>
+  Remove
+</button>
+
                       </div>
+					  
                     ))}
                   </div>
                 </div>
@@ -2153,11 +2496,16 @@ ${message.body_content || message.body_preview}`,
               </button>
               <button
                 onClick={saveProposal}
-                disabled={proposalRooms.length === 0}
+                disabled={proposalRooms.length === 0 || hasUnmappedRooms}
                 className="px-4 py-2 bg-sky-600 text-white rounded-lg hover:bg-sky-700 transition-all font-bold text-sm disabled:bg-slate-300 disabled:cursor-not-allowed"
               >
                 {editingProposal ? 'Update Proposal' : 'Add Proposal'}
               </button>
+			  {hasUnmappedRooms && (
+  <p className="text-xs text-amber-600 mt-2">
+    Some requested room types couldn’t be mapped. Please select real room types before saving.
+  </p>
+)}
             </div>
           </div>
         </div>

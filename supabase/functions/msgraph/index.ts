@@ -7,8 +7,6 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
-const EXTRACTION_VERSION = "extract-reservation-v3";
-
 interface OAuthCallbackRequest {
   code: string;
   mailbox_address: string;
@@ -506,22 +504,6 @@ async function autoExtractReservation(
       })
       .join("\n\n");
 
-    // Load existing reservation (if any)
-    const { data: existingReservation, error: resSelErr } = await supabase
-      .from("reservations")
-      .select("id, arrival_date, departure_date, nights, guest_name, guest_email, phone, adults, children, rooms, additional_info, status, source_channel, travel_agent_company, property_id, confirmation_no")
-      .eq("conversation_id", conversationId)
-      .maybeSingle();
-
-    if (resSelErr) {
-      console.error("Failed to read existing reservation:", resSelErr);
-      await markAttempt(`Failed to read existing reservation: ${safeErr(resSelErr)}`);
-      return;
-    }
-
-    const extractionAttemptedAt = new Date().toISOString();
-    const latestMessageAt = ordered[ordered.length - 1]?.receivedDateTime || ordered[ordered.length - 1]?.sentDateTime || null;
-
     // Call extractor
     const extractResponse = await fetch(
       `${Deno.env.get("SUPABASE_URL")}/functions/v1/extract-reservation`,
@@ -531,7 +513,7 @@ async function autoExtractReservation(
           apikey: Deno.env.get("SUPABASE_ANON_KEY") ?? "",
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ emailContent, reservationId: existingReservation?.id }),
+        body: JSON.stringify({ emailContent }),
       }
     );
 
@@ -539,19 +521,6 @@ async function autoExtractReservation(
     if (!extractResponse.ok) {
       const txt = await extractResponse.text().catch(() => "");
       console.error("extract-reservation failed:", txt);
-
-      if (existingReservation?.id) {
-        await supabase
-          .from("reservations")
-          .update({
-            last_extraction_attempted_at: extractionAttemptedAt,
-            last_extracted_message_at: latestMessageAt,
-            last_extraction_error: txt || `HTTP ${extractResponse.status}`,
-            extraction_version: EXTRACTION_VERSION,
-          })
-          .eq("id", existingReservation.id);
-      }
-
       await markAttempt(`extract-reservation failed (${extractResponse.status}): ${txt || "no body"}`);
       return;
     }
@@ -561,20 +530,20 @@ async function autoExtractReservation(
 
     if (!reservationData) {
       console.error("extract-reservation returned no data:", extractResult);
-
-      if (existingReservation?.id) {
-        await supabase
-          .from("reservations")
-          .update({
-            last_extraction_attempted_at: extractionAttemptedAt,
-            last_extracted_message_at: latestMessageAt,
-            last_extraction_error: "extract-reservation returned no data",
-            extraction_version: EXTRACTION_VERSION,
-          })
-          .eq("id", existingReservation.id);
-      }
-
       await markAttempt("extract-reservation returned no data");
+      return;
+    }
+
+    // Load existing reservation (if any)
+    const { data: existingReservation, error: resSelErr } = await supabase
+      .from("reservations")
+      .select("id, arrival_date, departure_date, guest_name, guest_email, adults, children, additional_info")
+      .eq("conversation_id", conversationId)
+      .maybeSingle();
+
+    if (resSelErr) {
+      console.error("Failed to read existing reservation:", resSelErr);
+      await markAttempt(`Failed to read existing reservation: ${safeErr(resSelErr)}`);
       return;
     }
 
@@ -601,23 +570,7 @@ async function autoExtractReservation(
         updateData.children = reservationData.child_count;
       }
 
-      if (reservationData.nights !== null && reservationData.nights !== undefined) updateData.nights = reservationData.nights;
-      if (reservationData.phone) updateData.phone = reservationData.phone;
-      if (reservationData.room_count !== null && reservationData.room_count !== undefined) updateData.rooms = reservationData.room_count;
-      if (reservationData.status) updateData.status = reservationData.status;
-      if (reservationData.source_channel) updateData.source_channel = reservationData.source_channel;
-      if (reservationData.travel_agent_company) updateData.travel_agent_company = reservationData.travel_agent_company;
-      if (reservationData.property_id) updateData.property_id = reservationData.property_id;
-      if (reservationData.confirmation_no) updateData.confirmation_no = reservationData.confirmation_no;
       if (reservationData.additional_info) updateData.additional_info = reservationData.additional_info;
-      if (reservationData.extra !== undefined) updateData.extra = reservationData.extra;
-      if (reservationData.extraction_confidence !== undefined) updateData.extraction_confidence = reservationData.extraction_confidence;
-
-      updateData.extracted_json = reservationData;
-      updateData.last_extraction_attempted_at = extractionAttemptedAt;
-      updateData.last_extracted_message_at = latestMessageAt;
-      updateData.last_extraction_error = null;
-      updateData.extraction_version = extractResult?.extraction_version || EXTRACTION_VERSION;
 
       if (Object.keys(updateData).length > 0) {
         const { data: updatedReservation, error: updateError } = await supabase
@@ -647,25 +600,11 @@ async function autoExtractReservation(
         departure_date: reservationData.departure_date ?? null,
         adults: reservationData.adult_count ?? 0,
         children: reservationData.child_count ?? 0,
-        nights: reservationData.nights ?? null,
-        phone: reservationData.phone ?? null,
-        rooms: reservationData.room_count ?? null,
         room_types: [],
         nightly_rate_currency: "ZAR",
         nightly_rate_amount: 0,
         additional_info: reservationData.additional_info ?? null,
-        status: reservationData.status ?? "pending",
-        source_channel: reservationData.source_channel ?? "email",
-        travel_agent_company: reservationData.travel_agent_company ?? null,
-        property_id: reservationData.property_id ?? null,
-        confirmation_no: reservationData.confirmation_no ?? null,
-        extracted_json: reservationData,
-        extra: reservationData.extra ?? null,
-        extraction_confidence: reservationData.extraction_confidence ?? null,
-        last_extraction_attempted_at: extractionAttemptedAt,
-        last_extracted_message_at: latestMessageAt,
-        last_extraction_error: null,
-        extraction_version: extractResult?.extraction_version || EXTRACTION_VERSION,
+        status: "pending",
       };
 
       const { data: newReservation, error: insertError } = await supabase
